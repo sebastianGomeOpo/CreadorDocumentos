@@ -384,7 +384,7 @@ def run_phase2(
     result = graph.invoke(initial_state)
     
     return result
-
+graph = build_phase2_graph()
 # =============================================================================
 # DIAGRAMA DEL GRAFO (para documentación)
 # =============================================================================

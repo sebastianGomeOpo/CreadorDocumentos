@@ -227,7 +227,7 @@ def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     result = graph.invoke(initial_state)
     
     return result
-
+graph = build_phase1_graph()
 # =============================================================================
 # DIAGRAMA DEL GRAFO (para documentación)
 # =============================================================================
