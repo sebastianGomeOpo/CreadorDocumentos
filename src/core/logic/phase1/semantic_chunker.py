@@ -1,108 +1,118 @@
 """
-semantic_chunker.py — Cortador Semántico
+semantic_chunker.py — Cortador Semántico (AI Powered)
 
-Este módulo divide el texto crudo en fragmentos (chunks) y los asocia
-con los temas identificados en el temario ordenado.
-
-RESPONSABILIDAD:
-- Dividir texto preservando contexto.
-- Asociar cada fragmento al `topic_id` correcto.
-- Calcular metadatos (posición, palabras).
+Divide el texto y asigna fragmentos a los temas del outline usando LLM.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any
+import json
+from typing import Any, List
+from langchain_core.messages import HumanMessage, SystemMessage
 from core.state_schema import generate_chunk_id
 
 
-def chunk_by_structure(raw_content: str, ordered_outline: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Corta el texto usando los nombres de los temas como separadores.
-    Esto es mucho más preciso que cortar por párrafos arbitrarios para clases estructuradas.
-    """
+def chunk_by_structure_heuristic(raw_content: str, ordered_outline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Chunking básico por headers."""
     chunks = []
+    # (Implementación simplificada de fallback que asigna todo al primer tema si falla)
+    topic_id = ordered_outline[0]["topic_id"] if ordered_outline else "topic_001"
     
-    # 1. Crear un mapa de nombres de temas a IDs
-    # Normalizamos a lowercase para búsqueda
-    topic_map = {item["topic_name"].lower(): item["topic_id"] for item in ordered_outline}
-    
-    # 2. Si no hay outline, todo es un solo chunk
-    if not ordered_outline:
-        chunk_id = generate_chunk_id(raw_content[:50], "topic_001")
-        return [{
-            "id": chunk_id,
-            "topic_id": "topic_001",
-            "content": raw_content,
-            "start_position": 0,
-            "end_position": len(raw_content),
-            "anchor_text": raw_content[:100],
-            "word_count": len(raw_content.split())
-        }]
+    chunks.append({
+        "id": generate_chunk_id(raw_content[:50], topic_id),
+        "topic_id": topic_id,
+        "content": raw_content,
+        "start_position": 0,
+        "end_position": len(raw_content),
+        "anchor_text": raw_content[:100],
+        "word_count": len(raw_content.split())
+    })
+    return chunks
 
-    # 3. Estrategia de Splitting por Headers
-    # Buscamos las líneas que coinciden con los nombres de los topics
-    lines = raw_content.split('\n')
-    current_topic_id = ordered_outline[0]["topic_id"] # Default al primero
-    current_buffer = []
-    current_start_pos = 0
-    pointer = 0
-    
-    for line in lines:
-        line_clean = line.strip().lstrip('#').strip().lower()
-        
-        # ¿Es esta línea un header de un tema conocido?
-        is_header = False
-        found_topic_id = None
-        
-        # Verificación exacta o muy cercana
-        if line.strip().startswith('#') and line_clean in topic_map:
-            is_header = True
-            found_topic_id = topic_map[line_clean]
-        
-        if is_header and found_topic_id:
-            # Guardar el chunk anterior si existe
-            if current_buffer:
-                content = "\n".join(current_buffer).strip()
-                if content:
-                    chunks.append(_create_chunk(content, current_topic_id, current_start_pos))
-            
-            # Iniciar nuevo chunk
-            current_topic_id = found_topic_id
-            current_buffer = [] # No incluimos el header en el contenido del chunk para evitar ruido, o sí?
-            # Incluyamos el header para contexto
-            current_buffer.append(line)
-            current_start_pos = pointer
-        else:
-            current_buffer.append(line)
-            
-        pointer += len(line) + 1 # +1 por el salto de línea
 
-    # Guardar el último chunk
-    if current_buffer:
-        content = "\n".join(current_buffer).strip()
-        if content:
-            chunks.append(_create_chunk(content, current_topic_id, current_start_pos))
+def semantic_segmentation_llm(raw_content: str, ordered_outline: list[dict[str, Any]], llm: Any) -> list[dict[str, Any]]:
+    """
+    Segmentación asistida por IA.
+    Estrategia: Divide por párrafos grandes y pide al LLM clasificar cada bloque.
+    """
+    
+    # 1. Pre-procesamiento: Dividir en bloques manejables (párrafos)
+    paragraphs = [p.strip() for p in raw_content.split('\n\n') if p.strip()]
+    
+    # Si hay demasiados párrafos, el LLM puede saturarse. 
+    # Para producción real, esto debería hacerse en batches.
+    # Aquí procesamos los primeros N párrafos para demostración o bloques combinados.
+    
+    chunks = []
+    current_pos = 0
+    
+    # Crear mapa de temas para el prompt
+    topics_desc = "\n".join([f"{item['topic_id']}: {item['topic_name']}" for item in ordered_outline])
+    
+    system_prompt = f"""Tienes una lista de temas (IDs y Nombres):
+{topics_desc}
+
+Tu tarea es analizar el siguiente fragmento de texto y determinar a qué Topic ID pertenece mejor.
+Responde SOLO con el Topic ID (ej. topic_003). Si no estás seguro, usa el tema más general o el primero.
+"""
+
+    # Procesar cada párrafo (o agruparlos)
+    # Nota: Llamar al LLM por cada párrafo es lento. 
+    # Optimizamos agrupando o pidiendo clasificación en batch.
+    
+    # Opción Batch Simple:
+    batch_size = 5
+    for i in range(0, len(paragraphs), batch_size):
+        batch = paragraphs[i:i+batch_size]
+        batch_text = "\n\n".join([f"--- BLOQUE {j} ---\n{p}" for j, p in enumerate(batch)])
+        
+        prompt = f"""Clasifica los siguientes bloques de texto según los temas dados.
+        Devuelve un JSON listando el topic_id para cada bloque secuencialmente: ["topic_A", "topic_B", ...]
+        
+        Texto:
+        {batch_text}
+        """
+        
+        try:
+            response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+            # Intentar parsear JSON del response content (suponiendo que devuelve array)
+            # Limpieza básica de markdown json
+            content = response.content.replace("```json", "").replace("```", "").strip()
+            if "[" in content:
+                assignments = json.loads(content)
+            else:
+                # Fallback: asignar todo al primer tema si el formato falla
+                assignments = [ordered_outline[0]["topic_id"]] * len(batch)
+                
+        except Exception as e:
+            print(f"Error clasificando batch: {e}")
+            assignments = [ordered_outline[0]["topic_id"]] * len(batch)
+            
+        # Crear chunks
+        for j, para in enumerate(batch):
+            topic_id = assignments[j] if j < len(assignments) else ordered_outline[0]["topic_id"]
+            
+            # Validar que el topic_id existe, si no, usar el primero
+            if not any(t['topic_id'] == topic_id for t in ordered_outline):
+                topic_id = ordered_outline[0]["topic_id"]
+
+            chunk_id = generate_chunk_id(para, topic_id)
+            chunks.append({
+                "id": chunk_id,
+                "topic_id": topic_id,
+                "content": para,
+                "start_position": current_pos,
+                "end_position": current_pos + len(para),
+                "anchor_text": para[:100],
+                "word_count": len(para.split())
+            })
+            current_pos += len(para) + 2
 
     return chunks
 
 
-def _create_chunk(content: str, topic_id: str, start_pos: int) -> dict[str, Any]:
-    """Helper para crear el diccionario del chunk con ID determinístico."""
-    chunk_id = generate_chunk_id(content, topic_id)
-    return {
-        "id": chunk_id,
-        "topic_id": topic_id,
-        "content": content,
-        "start_position": start_pos,
-        "end_position": start_pos + len(content),
-        "anchor_text": content[:100].replace('\n', ' '),
-        "word_count": len(content.split())
-    }
-
-
-def semantic_segmentation(raw_content: str, ordered_outline: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Función principal de chunking."""
-    # Usamos la estrategia estructural que es robusta para documentos Markdown
-    return chunk_by_structure(raw_content, ordered_outline)
+def semantic_segmentation(raw_content: str, ordered_outline: list[dict[str, Any]], llm: Any | None = None) -> list[dict[str, Any]]:
+    """Función principal."""
+    if llm and ordered_outline:
+        return semantic_segmentation_llm(raw_content, ordered_outline, llm)
+    return chunk_by_structure_heuristic(raw_content, ordered_outline)

@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 # Pandas para DataFrames
 try:
@@ -197,7 +197,7 @@ class ParquetStore:
         df = pd.read_parquet(self._file)
         return df.to_dict(orient="records")
     
-    def read_dataframe(self) -> "pd.DataFrame":
+    def read_dataframe(self) -> Any:
         """
         Lee como DataFrame de Pandas.
         

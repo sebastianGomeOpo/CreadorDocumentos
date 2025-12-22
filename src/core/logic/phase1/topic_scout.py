@@ -1,93 +1,111 @@
 """
-topic_scout.py — Detector de Temas
+topic_scout.py — Detector de Temas (AI Powered)
 
-Este módulo analiza el texto crudo para identificar los temas principales.
-Soporta dos modos:
-1. Heurístico (Regex): Extrae headers Markdown (#, ##, ###)
-2. LLM: Analiza el contenido semántico (pendiente de implementación completa)
-
-RESPONSABILIDAD:
-Convertir texto sin estructura en una lista de candidatos a temas (Topic objects).
+Analiza el texto crudo para identificar temas principales usando OpenAI.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any
+import json
+from typing import Any, List
 
-from core.state_schema import Topic
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel,Field # This is the new version
+
+# Esquema para salida estructurada del LLM
+class TopicSchema(BaseModel):
+    id: str = Field(description="ID único del tema (topic_XXX)")
+    name: str = Field(description="Nombre corto y claro del tema")
+    description: str = Field(description="Breve descripción del contenido que abarca")
+    keywords: List[str] = Field(description="Palabras clave asociadas")
+    complexity: str = Field(description="basic, intermediate, o advanced")
+
+class TopicListSchema(BaseModel):
+    topics: List[TopicSchema]
 
 
 def scout_topics_heuristic(raw_content: str) -> list[dict[str, Any]]:
-    """
-    Extrae temas basándose en la estructura Markdown del documento.
-    Asume que los headers (#, ##) representan los temas principales.
-    """
+    """Fallback heurístico si no hay LLM o falla."""
     topics = []
     lines = raw_content.split('\n')
-    
     count = 0
-    current_topic = None
     
-    # Si no hay headers, creamos un tema general
-    if not any(line.strip().startswith('#') for line in lines):
-        return [{
-            "id": "topic_001",
-            "name": "Contenido General",
-            "description": "Tema principal detectado automáticamente",
-            "keywords": ["general"],
-            "estimated_complexity": "intermediate",
-            "prerequisites": []
-        }]
-
+    # Detección básica por headers
     for line in lines:
-        line = line.strip()
-        # Detectar headers H1, H2, H3
-        if line.startswith('#'):
-            # Limpiar header (quitar # y espacios)
-            header_level = len(line.split()[0])
+        if line.strip().startswith('#'):
             name = line.lstrip('#').strip()
-            
-            # Solo procesar si tiene texto
-            if not name:
-                continue
-                
+            if not name: continue
             count += 1
-            topic_id = f"topic_{count:03d}"
-            
-            # Determinar complejidad por nivel de header (heurística simple)
-            complexity = "basic" if header_level == 1 else "intermediate"
-            if header_level >= 3:
-                complexity = "advanced"
-            
             topics.append({
-                "id": topic_id,
+                "id": f"topic_{count:03d}",
                 "name": name,
                 "description": f"Sección extraída: {name}",
-                "keywords": [w.lower() for w in name.split() if len(w) > 3],
-                "estimated_complexity": complexity,
+                "keywords": [],
+                "estimated_complexity": "intermediate",
                 "prerequisites": [],
-                "_original_header_level": header_level # Metadata interna útil para el sorter
             })
-
+            
+    if not topics:
+        topics.append({
+            "id": "topic_001",
+            "name": "Contenido General",
+            "description": "Tema principal detectado",
+            "keywords": [],
+            "estimated_complexity": "intermediate",
+            "prerequisites": []
+        })
     return topics
 
 
-async def scout_topics_llm(raw_content: str, llm: Any) -> list[dict[str, Any]]:
+def scout_topics_llm(raw_content: str, llm: Any) -> list[dict[str, Any]]:
+    """Extrae temas usando LLM."""
+    
+    system_prompt = """Eres un experto analista de contenidos educativos. 
+    Tu tarea es leer el siguiente texto y extraer una lista de los temas principales (Topics) que se tratan.
+    
+    Reglas:
+    1. Identifica temas coherentes y distintos.
+    2. Asigna un nivel de complejidad estimado.
+    3. Genera IDs secuenciales (topic_001, topic_002...).
+    4. Sé exhaustivo pero agrupa ideas menores bajo temas más grandes.
     """
-    (Placeholder) Extrae temas usando un LLM para textos sin formato Markdown.
-    """
-    # TODO: Implementar extracción semántica real
-    return scout_topics_heuristic(raw_content)
+    
+    # Usar salida estructurada si el modelo lo soporta (GPT-4o/Turbo)
+    structured_llm = llm.with_structured_output(TopicListSchema)
+    
+    try:
+        # Limitamos el contenido para no exceder tokens si es muy largo
+        content_preview = raw_content[:15000] 
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "Texto a analizar:\n\n{text}")
+        ])
+        
+        chain = prompt | structured_llm
+        result = chain.invoke({"text": content_preview})
+        
+        # Convertir a formato de diccionario del sistema
+        final_topics = []
+        for t in result.topics:
+            final_topics.append({
+                "id": t.id,
+                "name": t.name,
+                "description": t.description,
+                "keywords": t.keywords,
+                "estimated_complexity": t.complexity,
+                "prerequisites": []
+            })
+        return final_topics
+
+    except Exception as e:
+        print(f"Error en Topic Scout LLM: {e}. Usando fallback.")
+        return scout_topics_heuristic(raw_content)
 
 
 def scan_for_topics(raw_content: str, llm: Any | None = None) -> list[dict[str, Any]]:
-    """
-    Función principal de entrada.
-    """
+    """Función principal."""
     if llm:
-        # En el futuro, usaríamos await aquí o envolveríamos en runner asíncrono
-        # Por ahora, fallback a heurístico para el MVP estático
-        return scout_topics_heuristic(raw_content)
-    
+        return scout_topics_llm(raw_content, llm)
     return scout_topics_heuristic(raw_content)

@@ -1,52 +1,84 @@
 """
-topic_sorter.py — Organizador Didáctico
+topic_sorter.py — Organizador Didáctico (AI Powered)
 
-Este módulo toma una lista de temas desordenados y propone un
-orden lógico (temario) para la clase.
-
-RESPONSABILIDAD:
-Crear una estructura `OrderedOutlineItem` donde cada tema tiene
-una posición y una justificación.
+Ordena una lista de temas en una secuencia lógica de aprendizaje.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel,Field # This is the new version
+
+class OutlineItemSchema(BaseModel):
+    position: int
+    topic_id: str
+    topic_name: str
+    rationale: str = Field(description="Por qué este tema va en esta posición")
+
+class OutlineSchema(BaseModel):
+    items: List[OutlineItemSchema]
 
 
 def sort_topics_heuristic(topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Ordena los temas basándose en su orden de aparición original.
-    Mantiene la jerarquía implícita si existen metadatos de nivel de header.
-    """
-    ordered_outline = []
-    
+    """Ordenamiento simple por ID/aparición."""
+    ordered = []
     for i, topic in enumerate(topics):
-        # Generar una justificación básica
-        rationale = f"Tema {i+1} en la secuencia original del documento."
-        
-        # Detectar si es un subtema basado en la metadata interna del scout
-        original_level = topic.get("_original_header_level", 2)
-        
-        # Si quisiéramos hacer anidamiento real, aquí iría la lógica.
-        # Para este MVP, aplanamos la estructura pero mantenemos el orden.
-        
-        ordered_outline.append({
+        ordered.append({
             "position": i + 1,
             "topic_id": topic["id"],
             "topic_name": topic["name"],
-            "rationale": rationale,
-            "subtopics": [] # Podríamos rellenar esto si el topic es H1 y siguen H2s
+            "rationale": "Orden original del documento",
+            "subtopics": []
         })
+    return ordered
+
+
+def sort_topics_llm(topics: list[dict[str, Any]], llm: Any) -> list[dict[str, Any]]:
+    """Ordena temas usando LLM para flujo didáctico."""
+    
+    system_prompt = """Eres un arquitecto de planes de estudio.
+    Recibirás una lista de temas desordenados. Tu tarea es organizarlos en una secuencia lógica de aprendizaje.
+    
+    Criterios:
+    1. De lo simple a lo complejo.
+    2. Prerrequisitos primero.
+    3. Agrupa temas relacionados.
+    4. Provee una justificación (rationale) para cada posición.
+    """
+    
+    structured_llm = llm.with_structured_output(OutlineSchema)
+    
+    # Preparar input simplificado para el LLM
+    topics_str = "\n".join([f"- ID: {t['id']}, Nombre: {t['name']}, Desc: {t['description']}" for t in topics])
+    
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "Lista de temas:\n{topics}")
+        ])
         
-    return ordered_outline
+        chain = prompt | structured_llm
+        result = chain.invoke({"topics": topics_str})
+        
+        final_outline = []
+        for item in result.items:
+            final_outline.append({
+                "position": item.position,
+                "topic_id": item.topic_id,
+                "topic_name": item.topic_name,
+                "rationale": item.rationale,
+                "subtopics": [] 
+            })
+        return final_outline
+        
+    except Exception as e:
+        print(f"Error en Topic Sorter LLM: {e}")
+        return sort_topics_heuristic(topics)
 
 
-def create_ordered_outline(topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Función principal para generar el temario.
-    """
-    # En una versión avanzada, aquí un LLM reordenaría por dependencias
-    # (ej. "Conceptos Básicos" antes de "Aplicaciones Avanzadas").
-    # Por ahora, respetamos el flujo del autor.
+def create_ordered_outline(topics: list[dict[str, Any]], llm: Any | None = None) -> list[dict[str, Any]]:
+    """Función principal."""
+    if llm:
+        return sort_topics_llm(topics, llm)
     return sort_topics_heuristic(topics)
