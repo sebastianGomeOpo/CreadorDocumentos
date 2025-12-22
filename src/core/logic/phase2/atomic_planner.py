@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
@@ -108,8 +108,8 @@ class NotePlan:
     rationale: str
     novelty_score: float
     estimated_connections: int
-    priority: str = "medium"
-    note_type: str = "concept"
+    priority: Literal["high", "medium", "low"] = "medium"
+    note_type: Literal["concept", "example", "application", "contrast", "synthesis"] = "concept"
     
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -207,8 +207,8 @@ def plan_atomic_notes_heuristic(
         # Buscar topic correspondiente
         topic_id = f"topic_{i+1:03d}"
         for topic in topics:
-            if topic["name"].lower() in section_title.lower():
-                topic_id = topic["id"]
+            if isinstance(topic, dict) and topic.get("name", "").lower() in section_title.lower():
+                topic_id = topic.get("id", topic_id)
                 break
         
         # Decidir si crear nota
@@ -225,9 +225,24 @@ def plan_atomic_notes_heuristic(
         title_lower = section_title.lower()
         
         for existing_note in similar_notes:
-            if title_lower in existing_note.lower() or existing_note.lower() in title_lower:
+            existing_str = existing_note if isinstance(existing_note, str) else str(existing_note)
+            if title_lower in existing_str.lower() or existing_str.lower() in title_lower:
                 novelty = 0.3  # Probable duplicado
                 break
+        
+        # Determinar tipo y prioridad
+        if has_definition:
+            note_type: Literal["concept", "example", "application", "contrast", "synthesis"] = "concept"
+            priority: Literal["high", "medium", "low"] = "high"
+        elif has_examples:
+            note_type = "example"
+            priority = "medium"
+        elif has_list:
+            note_type = "application"
+            priority = "medium"
+        else:
+            note_type = "synthesis"
+            priority = "medium"
         
         # Nota principal del concepto
         notes_plan.append(NotePlan(
@@ -236,8 +251,8 @@ def plan_atomic_notes_heuristic(
             rationale=f"Concepto central de la sección ({word_count} palabras)",
             novelty_score=novelty,
             estimated_connections=2 if novelty > 0.5 else 1,
-            priority="high" if has_definition else "medium",
-            note_type="concept" if has_definition else "synthesis",
+            priority=priority,
+            note_type=note_type,
         ))
         
         # Nota adicional para ejemplos (si los hay y la sección es densa)
@@ -266,10 +281,10 @@ def plan_atomic_notes_heuristic(
     
     # Si no se generaron notas, crear al menos una
     if not notes_plan and topics:
-        main_topic = topics[0]
+        main_topic = topics[0] if isinstance(topics[0], dict) else {"id": "topic_001", "name": str(topics[0])}
         notes_plan.append(NotePlan(
-            proposed_title=main_topic["name"],
-            topic_id=main_topic["id"],
+            proposed_title=main_topic.get("name", "Tema Principal"),
+            topic_id=main_topic.get("id", "topic_001"),
             rationale="Nota principal del contenido",
             novelty_score=0.8,
             estimated_connections=1,
@@ -300,7 +315,7 @@ def plan_atomic_notes_heuristic(
 # PLANIFICACIÓN CON LLM
 # =============================================================================
 
-async def plan_atomic_notes_llm(
+def plan_atomic_notes_llm(
     ordered_class: str,
     similar_notes: list[dict[str, Any]],
     graph_context: dict[str, Any],
@@ -326,7 +341,7 @@ async def plan_atomic_notes_llm(
         for n in similar_notes[:10]
     ]) or "No hay notas similares existentes."
     
-    graph_context_str = json.dumps(graph_context, indent=2, ensure_ascii=False)[:2000]
+    graph_context_str = json.dumps(graph_context, indent=2, ensure_ascii=False, default=str)[:2000]
     
     # Construir mensajes
     messages = [
@@ -339,48 +354,52 @@ async def plan_atomic_notes_llm(
     ]
     
     # Invocar LLM
-    response = await llm.ainvoke(messages)
-    response_text = response.content
-    
-    # Parsear JSON
-    json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-    if json_match:
-        json_str = json_match.group(1)
-    else:
-        json_str = response_text
-    
     try:
+        response = llm.invoke(messages)
+        response_text = response.content
+        
+        # Parsear JSON
+        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            json_str = response_text
+        
         data = json.loads(json_str)
-    except json.JSONDecodeError:
-        # Fallback a heurísticas
+        
+        # Convertir a AtomicPlan
+        notes = []
+        for note_data in data.get("notes", []):
+            notes.append(NotePlan(
+                proposed_title=note_data.get("proposed_title", "Sin título"),
+                topic_id=note_data.get("topic_id", "topic_001"),
+                rationale=note_data.get("rationale", ""),
+                novelty_score=float(note_data.get("novelty_score", 0.5)),
+                estimated_connections=int(note_data.get("estimated_connections", 1)),
+                priority=note_data.get("priority", "medium"),
+                note_type=note_data.get("type", "concept"),
+            ))
+        
+        skipped = []
+        for skip_data in data.get("skipped_content", []):
+            skipped.append(SkippedContent(
+                description=skip_data.get("description", ""),
+                reason=skip_data.get("reason", ""),
+            ))
+        
+        return AtomicPlan(
+            summary=data.get("plan_summary", "Plan generado por LLM"),
+            notes=notes,
+            skipped=skipped,
+            moc_impact=data.get("moc_impact", []),
+        )
+        
+    except json.JSONDecodeError as e:
+        print(f"Error parseando JSON del LLM: {e}")
         return plan_atomic_notes_heuristic(ordered_class, [])
-    
-    # Convertir a AtomicPlan
-    notes = []
-    for note_data in data.get("notes", []):
-        notes.append(NotePlan(
-            proposed_title=note_data.get("proposed_title", "Sin título"),
-            topic_id=note_data.get("topic_id", "topic_001"),
-            rationale=note_data.get("rationale", ""),
-            novelty_score=float(note_data.get("novelty_score", 0.5)),
-            estimated_connections=int(note_data.get("estimated_connections", 1)),
-            priority=note_data.get("priority", "medium"),
-            note_type=note_data.get("type", "concept"),
-        ))
-    
-    skipped = []
-    for skip_data in data.get("skipped_content", []):
-        skipped.append(SkippedContent(
-            description=skip_data.get("description", ""),
-            reason=skip_data.get("reason", ""),
-        ))
-    
-    return AtomicPlan(
-        summary=data.get("plan_summary", "Plan generado por LLM"),
-        notes=notes,
-        skipped=skipped,
-        moc_impact=data.get("moc_impact", []),
-    )
+    except Exception as e:
+        print(f"Error en planner LLM: {e}")
+        return plan_atomic_notes_heuristic(ordered_class, [])
 
 
 # =============================================================================
@@ -407,25 +426,37 @@ def create_atomic_plan(
     """
     context = graph_rag_context or {}
     similar_notes = context.get("similar_notes", [])
+    similar_notes_data = context.get("similar_notes_data", [])
     
-    # Por ahora usar heurísticas (async requiere event loop)
-    plan = plan_atomic_notes_heuristic(
-        ordered_class=ordered_class,
-        topics=topics,
-        similar_notes=similar_notes,
-        graph_context=context,
-    )
+    # Elegir estrategia
+    if llm and similar_notes_data:
+        plan = plan_atomic_notes_llm(
+            ordered_class=ordered_class,
+            similar_notes=similar_notes_data,
+            graph_context=context,
+            llm=llm,
+        )
+    else:
+        plan = plan_atomic_notes_heuristic(
+            ordered_class=ordered_class,
+            topics=topics,
+            similar_notes=similar_notes,
+            graph_context=context,
+        )
     
     # Convertir notas a formato esperado por el state
+    # Incluyendo priority y type para compatibilidad con AtomicNotePlan
     atomic_plan = []
-    for note in plan.notes:
+    for i, note in enumerate(plan.notes):
         atomic_plan.append({
-            "id": f"plan_{note.topic_id}_{len(atomic_plan)+1:03d}",
+            "id": f"plan_{note.topic_id}_{i+1:03d}",
             "topic_id": note.topic_id,
             "proposed_title": note.proposed_title,
             "rationale": note.rationale,
             "novelty_score": note.novelty_score,
             "estimated_connections": note.estimated_connections,
+            "priority": note.priority,
+            "type": note.note_type,
         })
     
     return {

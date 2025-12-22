@@ -66,14 +66,19 @@ class SourceMetadata(BaseModel):
         return f"src_{self.file_hash[:16]}"
 
 
+# Busca la clase Topic y reemplázala con esto:
 class Topic(BaseModel):
     """Un tema detectado en el texto fuente."""
     id: str
     name: str
-    description: str
+    description: str = ""   # <--- Ahora es opcional y tiene default
     keywords: list[str] = Field(default_factory=list)
     estimated_complexity: Literal["basic", "intermediate", "advanced"] = "intermediate"
-    prerequisites: list[str] = Field(default_factory=list)  # IDs de otros topics
+    prerequisites: list[str] = Field(default_factory=list)
+    
+    # <--- AGREGADOS PARA EVITAR WARNINGS ---
+    relevance: int = 50       
+    type: str = "concept"
 
 
 class OrderedOutlineItem(BaseModel):
@@ -122,6 +127,9 @@ class AtomicNotePlan(BaseModel):
     rationale: str                          # Por qué vale la pena esta nota
     novelty_score: float = Field(ge=0, le=1)  # 0=duplicado, 1=totalmente nuevo
     estimated_connections: int              # Cuántos enlaces se esperan
+    # Campos agregados para compatibilidad
+    priority: Literal["high", "medium", "low"] = "medium"
+    type: Literal["concept", "example", "application", "contrast", "synthesis"] = "concept"
 
 
 class AtomicNote(BaseModel):
@@ -312,7 +320,7 @@ class Phase1State(TypedDict, total=False):
     # Output
     ordered_class_markdown: str
     warnings: list[dict]
-    
+    bundle: dict  # <--- AGREGA ESTA LÍNEA (CRÍTICO)
     # Control
     current_node: str
     error: str | None

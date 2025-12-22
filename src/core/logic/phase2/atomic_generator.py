@@ -26,7 +26,9 @@ CONEXIONES:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import re
 from datetime import datetime
 from typing import Any
@@ -383,7 +385,7 @@ def generate_links(
 # GENERACIÓN CON LLM
 # =============================================================================
 
-async def generate_note_llm(
+def generate_note_llm(
     plan_item: dict[str, Any],
     source_content: str,
     lesson_id: str,
@@ -391,7 +393,7 @@ async def generate_note_llm(
     llm: BaseChatModel,
 ) -> dict[str, Any]:
     """
-    Genera una nota atómica usando un LLM.
+    Genera una nota atómica usando un LLM (versión síncrona).
     
     Args:
         plan_item: Item del plan
@@ -403,8 +405,6 @@ async def generate_note_llm(
     Returns:
         Nota generada
     """
-    import json
-    
     # Formatear notas relacionadas
     related_str = "\n".join([
         f"- {n.get('title', 'Sin título')}"
@@ -417,6 +417,9 @@ async def generate_note_llm(
         plan_item.get("proposed_title", "")
     )
     
+    if not relevant_content:
+        relevant_content = source_content[:2000]
+    
     messages = [
         SystemMessage(content=ATOMIC_GENERATOR_SYSTEM_PROMPT),
         HumanMessage(content=ATOMIC_GENERATOR_USER_PROMPT.format(
@@ -428,42 +431,47 @@ async def generate_note_llm(
         )),
     ]
     
-    response = await llm.ainvoke(messages)
-    response_text = response.content
-    
-    # Parsear JSON
-    json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-    if json_match:
-        json_str = json_match.group(1)
-    else:
-        json_str = response_text
-    
     try:
+        response = llm.invoke(messages)
+        response_text = response.content
+        
+        # Parsear JSON
+        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            json_str = response_text
+        
         data = json.loads(json_str)
-    except json.JSONDecodeError:
-        # Fallback
+        
+        # Construir nota
+        title = data.get("title", plan_item.get("proposed_title", "Sin título"))
+        note_id = generate_note_id(title, lesson_id)
+        note_type = plan_item.get("type", "concept")
+        topic_id = plan_item.get("topic_id", "topic_001")
+        
+        return {
+            "id": note_id,
+            "title": title,
+            "content": data.get("content", ""),
+            "frontmatter": {
+                "tags": data.get("tags", [note_type]),
+                "status": "draft",
+                "type": note_type,
+                "source_lesson": lesson_id,
+                "topic": topic_id,
+            },
+            "source_id": lesson_id,
+            "chunk_ids": [],
+            "created_at": datetime.now().isoformat(),
+        }
+        
+    except json.JSONDecodeError as e:
+        print(f"Error parseando JSON del LLM: {e}")
         return generate_note_heuristic(plan_item, source_content, lesson_id)
-    
-    # Construir nota
-    title = data.get("title", plan_item.get("proposed_title", "Sin título"))
-    note_id = generate_note_id(title, lesson_id)
-    
-    return {
-        "id": note_id,
-        "title": title,
-        "content": data.get("content", ""),
-        "frontmatter": {
-            "tags": data.get("tags", []),
-            "status": "draft",
-            "type": plan_item.get("type", "concept"),
-            "source_lesson": lesson_id,
-        },
-        "source_id": lesson_id,
-        "chunk_ids": [],
-        "created_at": datetime.now().isoformat(),
-        "_proposed_links": data.get("proposed_links", []),
-        "_key_quote": data.get("key_quote"),
-    }
+    except Exception as e:
+        print(f"Error generando nota con LLM: {e}")
+        return generate_note_heuristic(plan_item, source_content, lesson_id)
 
 
 # =============================================================================
@@ -492,17 +500,29 @@ def generate_atomic_notes(
     """
     context = graph_rag_context or {}
     similar_notes = context.get("similar_notes", [])
+    similar_notes_data = context.get("similar_notes_data", [])
     
     notes = []
     
     # Generar cada nota
     for plan_item in atomic_plan:
-        note = generate_note_heuristic(
-            plan_item=plan_item,
-            source_content=ordered_class,
-            lesson_id=lesson_id,
-            related_notes=similar_notes,
-        )
+        if llm:
+            # Usar LLM para generación
+            note = generate_note_llm(
+                plan_item=plan_item,
+                source_content=ordered_class,
+                lesson_id=lesson_id,
+                related_notes=similar_notes_data,
+                llm=llm,
+            )
+        else:
+            # Usar heurísticas
+            note = generate_note_heuristic(
+                plan_item=plan_item,
+                source_content=ordered_class,
+                lesson_id=lesson_id,
+                related_notes=similar_notes,
+            )
         notes.append(note)
     
     # Generar enlaces
@@ -528,3 +548,4 @@ def generate_atomic_notes(
         "linking_matrix": links,
         "moc_updates": moc_updates[:5],  # Limitar MOC updates
     }
+
