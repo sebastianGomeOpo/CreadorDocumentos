@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "fase1": "./src/core/graphs/phase1_graph.py:graph",
+    "fase2": "./src/core/graphs/phase2_graph.py:graph"
+  },
+  "env": ".env"
+}

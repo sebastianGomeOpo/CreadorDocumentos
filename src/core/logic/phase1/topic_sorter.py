@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from typing import Any, List
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel,Field # This is the new version
+from pydantic import BaseModel, Field
+
+# =============================================================================
+# SCHEMAS
+# =============================================================================
 
 class OutlineItemSchema(BaseModel):
     position: int
@@ -19,20 +23,59 @@ class OutlineItemSchema(BaseModel):
 class OutlineSchema(BaseModel):
     items: List[OutlineItemSchema]
 
+# =============================================================================
+# FUNCIONES AUXILIARES
+# =============================================================================
+
+def _normalize_topics(topics: list[Any]) -> list[dict[str, Any]]:
+    """
+    Convierte cualquier entrada (lista de strings o dicts) 
+    a una lista estandarizada de diccionarios.
+    Evita el error 'string indices must be integers'.
+    """
+    normalized = []
+    for i, t in enumerate(topics):
+        if isinstance(t, dict):
+            # Ya es un diccionario, aseguramos que tenga ID
+            if "id" not in t:
+                t["id"] = f"topic_{i:03d}"
+            if "name" not in t:
+                t["name"] = "Tema sin nombre"
+            normalized.append(t)
+        elif isinstance(t, str):
+            # Es un string, lo convertimos a dict
+            normalized.append({
+                "id": f"topic_{i:03d}",
+                "name": t,
+                "description": "Tema detectado",
+                "relevance": 50
+            })
+        else:
+            # Caso raro, convertir a string y luego a dict
+            normalized.append({
+                "id": f"topic_{i:03d}",
+                "name": str(t),
+                "description": "Objeto desconocido"
+            })
+    return normalized
+
+# =============================================================================
+# LÓGICA DE ORDENAMIENTO
+# =============================================================================
 
 def sort_topics_heuristic(topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ordenamiento simple por ID/aparición."""
+    """Ordenamiento simple por ID/aparición (Fallback)."""
     ordered = []
     for i, topic in enumerate(topics):
+        # Ahora topic siempre será un dict gracias a _normalize_topics
         ordered.append({
             "position": i + 1,
-            "topic_id": topic["id"],
-            "topic_name": topic["name"],
+            "topic_id": topic.get("id", f"topic_{i:03d}"),
+            "topic_name": topic.get("name", "Sin nombre"),
             "rationale": "Orden original del documento",
             "subtopics": []
         })
     return ordered
-
 
 def sort_topics_llm(topics: list[dict[str, Any]], llm: Any) -> list[dict[str, Any]]:
     """Ordena temas usando LLM para flujo didáctico."""
@@ -49,8 +92,11 @@ def sort_topics_llm(topics: list[dict[str, Any]], llm: Any) -> list[dict[str, An
     
     structured_llm = llm.with_structured_output(OutlineSchema)
     
-    # Preparar input simplificado para el LLM
-    topics_str = "\n".join([f"- ID: {t['id']}, Nombre: {t['name']}, Desc: {t['description']}" for t in topics])
+    # Preparar input seguro para el LLM
+    topics_str = "\n".join([
+        f"- ID: {t.get('id')}, Nombre: {t.get('name')}, Desc: {t.get('description', '')}" 
+        for t in topics
+    ])
     
     try:
         prompt = ChatPromptTemplate.from_messages([
@@ -76,9 +122,17 @@ def sort_topics_llm(topics: list[dict[str, Any]], llm: Any) -> list[dict[str, An
         print(f"Error en Topic Sorter LLM: {e}")
         return sort_topics_heuristic(topics)
 
+# =============================================================================
+# PUNTO DE ENTRADA
+# =============================================================================
 
-def create_ordered_outline(topics: list[dict[str, Any]], llm: Any | None = None) -> list[dict[str, Any]]:
-    """Función principal."""
+def create_ordered_outline(topics: list[Any], llm: Any | None = None) -> list[dict[str, Any]]:
+    """Función principal llamada desde el grafo."""
+    
+    # 1. Normalizar entrada para evitar crashes
+    clean_topics = _normalize_topics(topics)
+    
+    # 2. Elegir estrategia
     if llm:
-        return sort_topics_llm(topics, llm)
-    return sort_topics_heuristic(topics)
+        return sort_topics_llm(clean_topics, llm)
+    return sort_topics_heuristic(clean_topics)

@@ -20,6 +20,7 @@ FLUJO:
 
 CONEXIONES:
 - Usa: core/state_schema.py (Phase1State)
+- Usa: core/logic/phase1/ (módulos de lógica)
 - Escribe: data/staging/phase1_pending/
 - Llamado por: watcher_phase1.py
 """
@@ -32,6 +33,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from langgraph.graph import END, StateGraph
+import os
+from dotenv import load_dotenv
 
 from core.state_schema import (
     OrderedOutlineItem,
@@ -45,6 +48,75 @@ from core.state_schema import (
     generate_chunk_id,
     generate_source_id,
 )
+
+# Importar módulos de lógica
+from core.logic.phase1.topic_scout import scan_for_topics
+from core.logic.phase1.topic_sorter import create_ordered_outline
+from core.logic.phase1.semantic_chunker import semantic_segmentation
+from core.logic.phase1.class_redactor import generate_ordered_class
+
+
+# =============================================================================
+# CONFIGURACIÓN DE LLM (opcional)
+# =============================================================================
+
+# Cargar variables de entorno
+load_dotenv()
+
+def get_llm():
+    """
+    Obtiene instancia del LLM configurado desde .env
+    
+    Variables esperadas:
+        - OPENAI_API_KEY: API key de OpenAI
+        - DEFAULT_LLM_MODEL: Modelo a usar (default: gpt-4o-mini)
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("⚠️ OPENAI_API_KEY no configurada, usando heurísticas")
+            return None
+        
+        model = os.getenv("DEFAULT_LLM_MODEL", "gpt-4o-mini")
+        
+        return ChatOpenAI(
+            model=model,
+            temperature=0,
+            api_key=api_key
+        )
+    except ImportError:
+        print("⚠️ langchain_openai no instalado, usando heurísticas")
+        return None
+    except Exception as e:
+        print(f"⚠️ Error inicializando LLM: {e}")
+        return None
+
+
+def get_fast_llm():
+    """
+    Obtiene instancia del LLM rápido para tareas simples.
+    
+    Variables esperadas:
+        - FAST_LLM_MODEL: Modelo rápido (default: gpt-4o-mini)
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        
+        model = os.getenv("FAST_LLM_MODEL", "gpt-4o-mini")
+        
+        return ChatOpenAI(
+            model=model,
+            temperature=0,
+            api_key=api_key
+        )
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -65,38 +137,10 @@ def topic_scout(state: Phase1State) -> dict[str, Any]:
         - topics: Lista de temas detectados
     """
     raw_content = state["raw_content"]
+    llm = get_llm()
     
-    # TODO: Aquí va la llamada al LLM
-    # Por ahora, stub que detecta "temas" basándose en headers markdown
-    topics = []
-    
-    # Placeholder: detectar headers como temas
-    lines = raw_content.split("\n")
-    topic_count = 0
-    
-    for line in lines:
-        if line.startswith("# ") or line.startswith("## "):
-            topic_count += 1
-            topic_name = line.lstrip("#").strip()
-            topics.append({
-                "id": f"topic_{topic_count:03d}",
-                "name": topic_name,
-                "description": f"Tema extraído: {topic_name}",
-                "keywords": topic_name.lower().split(),
-                "estimated_complexity": "intermediate",
-                "prerequisites": [],
-            })
-    
-    # Si no hay headers, crear un tema genérico
-    if not topics:
-        topics.append({
-            "id": "topic_001",
-            "name": "Contenido Principal",
-            "description": "Tema único detectado en el documento",
-            "keywords": [],
-            "estimated_complexity": "intermediate",
-            "prerequisites": [],
-        })
+    # Usar módulo de lógica
+    topics = scan_for_topics(raw_content, llm=llm)
     
     return {
         "topics": topics,
@@ -118,19 +162,10 @@ def topic_sorter(state: Phase1State) -> dict[str, Any]:
         - ordered_outline: Temario ordenado con justificaciones
     """
     topics = state["topics"]
+    llm = get_llm()
     
-    # TODO: Aquí va la llamada al LLM para ordenar
-    # Por ahora, mantener el orden original con justificación genérica
-    
-    ordered_outline = []
-    for i, topic in enumerate(topics):
-        ordered_outline.append({
-            "position": i + 1,
-            "topic_id": topic["id"],
-            "topic_name": topic["name"],
-            "rationale": f"Posición {i+1}: orden de aparición en el texto original",
-            "subtopics": [],
-        })
+    # Usar módulo de lógica
+    ordered_outline = create_ordered_outline(topics, llm=llm)
     
     return {
         "ordered_outline": ordered_outline,
@@ -154,34 +189,10 @@ def semantic_chunker(state: Phase1State) -> dict[str, Any]:
     """
     raw_content = state["raw_content"]
     ordered_outline = state["ordered_outline"]
+    llm = get_llm()
     
-    # TODO: Chunking semántico real con LLM
-    # Por ahora, chunking simple por párrafos
-    
-    chunks = []
-    paragraphs = raw_content.split("\n\n")
-    
-    current_pos = 0
-    default_topic_id = ordered_outline[0]["topic_id"] if ordered_outline else "topic_001"
-    
-    for para in paragraphs:
-        if not para.strip():
-            current_pos += len(para) + 2
-            continue
-        
-        chunk_id = generate_chunk_id(para, default_topic_id)
-        
-        chunks.append({
-            "id": chunk_id,
-            "topic_id": default_topic_id,
-            "content": para.strip(),
-            "start_position": current_pos,
-            "end_position": current_pos + len(para),
-            "anchor_text": para[:50].strip() + "...",
-            "word_count": len(para.split()),
-        })
-        
-        current_pos += len(para) + 2
+    # Usar módulo de lógica
+    chunks = semantic_segmentation(raw_content, ordered_outline, llm=llm)
     
     return {
         "semantic_chunks": chunks,
@@ -206,37 +217,14 @@ def class_redactor(state: Phase1State) -> dict[str, Any]:
     """
     chunks = state["semantic_chunks"]
     outline = state["ordered_outline"]
+    llm = get_llm()
     
-    # TODO: Redacción con LLM
-    # Por ahora, reconstruir con headers
-    
-    lines = ["# Clase Ordenada", ""]
-    warnings = []
-    
-    for item in outline:
-        lines.append(f"## {item['topic_name']}")
-        lines.append("")
-        
-        # Añadir chunks del tema
-        topic_chunks = [c for c in chunks if c["topic_id"] == item["topic_id"]]
-        
-        if not topic_chunks:
-            warnings.append({
-                "type": "gap",
-                "description": f"No se encontró contenido para el tema: {item['topic_name']}",
-                "location": item["topic_id"],
-                "severity": "medium",
-            })
-        
-        for chunk in topic_chunks:
-            lines.append(chunk["content"])
-            lines.append("")
-    
-    ordered_class_markdown = "\n".join(lines)
+    # Usar módulo de lógica
+    result = generate_ordered_class(outline, chunks, llm=llm)
     
     return {
-        "ordered_class_markdown": ordered_class_markdown,
-        "warnings": warnings,
+        "ordered_class_markdown": result["ordered_class_markdown"],
+        "warnings": result.get("warnings", []),
         "current_node": "class_redactor",
     }
 
@@ -414,3 +402,4 @@ PHASE1_GRAPH_DIAGRAM = """
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 """
+
