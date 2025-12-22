@@ -101,19 +101,22 @@ class VaultWriter:
                 if op.operation == "create":
                     # Crear directorios padre si no existen
                     Path(op.target_path).parent.mkdir(parents=True, exist_ok=True)
-                    # Renombre atómico
-                    os.rename(op.temp_path, op.target_path)
+                    # Renombre atómico (CAMBIO: replace)
+                    os.replace(op.temp_path, op.target_path)
                     files_written.append(op.target_path)
                 elif op.operation == "update":
                     # Backup + renombre
                     backup_path = f"{op.target_path}.backup"
                     if Path(op.target_path).exists():
                         shutil.copy2(op.target_path, backup_path)
-                    os.rename(op.temp_path, op.target_path)
+                    
+                    # Renombre atómico (CAMBIO: replace)
+                    os.replace(op.temp_path, op.target_path)
+                    
                     # Limpiar backup si todo bien
                     Path(backup_path).unlink(missing_ok=True)
                     files_written.append(op.target_path)
-            
+                    
             # 5. Marcar completado
             self.wal.mark_committed(tx.transaction_id)
             

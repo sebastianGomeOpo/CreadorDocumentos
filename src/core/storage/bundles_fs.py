@@ -17,12 +17,31 @@ CONEXIONES:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import shutil
+import sys  # <--- Agregado
+import os   # <--- Agregado
 from datetime import datetime
 from pathlib import Path
 from typing import Generator, Literal
+
+# === INICIO MODIFICACIÓN WINDOWS ===
+# Reemplaza la linea 'import fcntl' con esto:
+try:
+    import fcntl
+except ImportError:
+    if os.name == 'nt':  # Si es Windows
+        class fcntl:
+            LOCK_EX = 0
+            LOCK_SH = 0
+            LOCK_UN = 0
+            
+            @staticmethod
+            def flock(fd, op):
+                pass # No-op en Windows para desarrollo local
+    else:
+        raise
+# === FIN MODIFICACIÓN WINDOWS ===
 
 from core.state_schema import (
     ApprovalStatus,

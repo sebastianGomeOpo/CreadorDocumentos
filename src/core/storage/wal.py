@@ -324,7 +324,9 @@ class WriteAheadLog:
         temp_file = self.current_path.with_suffix(".tmp")
         with open(temp_file, "w") as f:
             f.write(tx.to_json())
-        os.rename(temp_file, self.current_path)
+        
+        # CAMBIO: Usar replace en lugar de rename para compatibilidad Windows
+        os.replace(temp_file, self.current_path)
     
     def _cleanup_temp(self, tx: TransactionRecord) -> None:
         """Limpia archivos temporales de una transacción."""
