@@ -1,26 +1,19 @@
 """
-watcher_phase1.py — Vigilante de Inbox para Fase 1
+watcher_phase1.py — Vigilante de Inbox para Fase 1 V2
 
 Este proceso vigila la carpeta data/inbox/raw_classes/ y dispara
-el Phase1Graph cuando detecta archivos nuevos o modificados.
+el Phase1Graph V2 cuando detecta archivos nuevos.
 
 COMPORTAMIENTO:
 1. Escanea la carpeta inbox cada N segundos
 2. Detecta archivos .txt/.md nuevos o modificados
-3. Ejecuta Phase1Graph para cada archivo
+3. Ejecuta Phase1Graph V2 (arquitectura paralela)
 4. Guarda el bundle resultante en staging/phase1_pending/
-5. Mueve el archivo procesado a un directorio de "processed"
-
-CONEXIONES:
-- Vigila: data/inbox/raw_classes/
-- Ejecuta: core/graphs/phase1_graph.py
-- Escribe: data/staging/phase1_pending/
-- Mueve a: data/inbox/processed/
+5. Mueve el archivo procesado a "processed"
 
 USO:
     python watcher_phase1.py
-    
-    # O con intervalo personalizado:
+    python watcher_phase1.py --once
     python watcher_phase1.py --interval 10
 """
 
@@ -40,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.graphs.phase1_graph import run_phase1
-from core.state_schema import Phase1Bundle, generate_bundle_id
+from core.state_schema import Phase1Bundle
 from core.storage.bundles_fs import BundleStore
 
 
@@ -52,7 +45,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("watcher_phase1")
+logger = logging.getLogger("watcher_phase1_v2")
 
 
 class Phase1Watcher:
@@ -66,8 +59,8 @@ class Phase1Watcher:
         # Directorios
         self.inbox_path = self.base_path / "inbox" / "raw_classes"
         self.processed_path = self.base_path / "inbox" / "processed"
-        self.lessons_ordered_path = self.base_path / "lessons" / "ordered"
-        self.lessons_chunks_path = self.base_path / "lessons" / "chunks"
+        self.drafts_path = self.base_path / "drafts"
+        self.notes_path = self.base_path / "section_notes"
         
         # Storage
         self.bundle_store = BundleStore(self.base_path)
@@ -81,16 +74,18 @@ class Phase1Watcher:
         self._load_state()
     
     def _ensure_directories(self) -> None:
+        """Crea los directorios necesarios."""
         for path in [
             self.inbox_path,
             self.processed_path,
-            self.lessons_ordered_path,
-            self.lessons_chunks_path,
+            self.drafts_path,
+            self.notes_path,
             self.state_file.parent,
         ]:
             path.mkdir(parents=True, exist_ok=True)
     
     def _load_state(self) -> None:
+        """Carga el estado persistido del watcher."""
         if self.state_file.exists():
             try:
                 with open(self.state_file, "r") as f:
@@ -101,15 +96,19 @@ class Phase1Watcher:
                 self.processed_hashes = {}
     
     def _save_state(self) -> None:
+        """Persiste el estado del watcher."""
         with open(self.state_file, "w") as f:
             json.dump({"processed_hashes": self.processed_hashes}, f, indent=2)
     
     def _get_file_hash(self, path: Path) -> str:
+        """Calcula hash SHA256 de un archivo."""
         with open(path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
     
     def scan_inbox(self) -> list[Path]:
+        """Escanea inbox por archivos nuevos o modificados."""
         to_process = []
+        
         for ext in ["*.txt", "*.md"]:
             for file_path in self.inbox_path.glob(ext):
                 if file_path.is_file():
@@ -118,10 +117,20 @@ class Phase1Watcher:
                     
                     if previous_hash != current_hash:
                         to_process.append(file_path)
+        
         return to_process
     
     def process_file(self, file_path: Path) -> bool:
-        logger.info(f"Procesando: {file_path.name}")
+        """
+        Procesa un archivo con Phase1Graph V2.
+        
+        Args:
+            file_path: Ruta al archivo
+            
+        Returns:
+            True si se procesó exitosamente
+        """
+        logger.info(f"📄 Procesando: {file_path.name}")
         
         try:
             # 1. Leer contenido
@@ -129,95 +138,111 @@ class Phase1Watcher:
                 raw_content = f.read()
             
             if not raw_content.strip():
-                logger.warning(f"Archivo vacío: {file_path.name}")
+                logger.warning(f"  ⚠️ Archivo vacío: {file_path.name}")
                 return False
             
-            # 2. Ejecutar Phase1Graph
-            logger.info("  Ejecutando Phase1Graph...")
+            # 2. Ejecutar Phase1Graph V2
+            logger.info("  🚀 Ejecutando Phase1Graph V2...")
+            start_time = time.time()
+            
             result = run_phase1(file_path, raw_content)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"  ⏱️ Completado en {elapsed:.2f}s")
             
             # 3. Extraer bundle del resultado
             bundle_dict = result.get("bundle")
             if not bundle_dict:
-                logger.error("  No se generó bundle")
+                logger.error("  ❌ No se generó bundle")
                 return False
             
             # 4. Convertir a Phase1Bundle y guardar
-            # NOTA: bundle_dict tiene source_metadata como dict, pero al crear Phase1Bundle
-            # Pydantic lo convierte a objeto SourceMetadata.
             bundle = Phase1Bundle(
-                schema_version="1.0.0",
+                schema_version="2.0.0",
                 bundle_id=bundle_dict["bundle_id"],
                 source_metadata=bundle_dict["source_metadata"],
                 raw_content_preview=bundle_dict["raw_content_preview"],
-                topics=bundle_dict["topics"],
-                ordered_outline=bundle_dict["ordered_outline"],
-                semantic_chunks=bundle_dict["semantic_chunks"],
-                ordered_class_markdown=bundle_dict["ordered_class_markdown"],
+                master_plan=bundle_dict.get("master_plan"),
+                topics=bundle_dict.get("topics", []),
+                ordered_outline=bundle_dict.get("ordered_outline", []),
+                semantic_chunks=[],  # V2 no usa chunks en memoria
+                ordered_class_markdown=bundle_dict.get("ordered_class_markdown", ""),
+                draft_path=bundle_dict.get("draft_path", ""),
+                section_notes_dir=bundle_dict.get("section_notes_dir", ""),
+                chunk_files=bundle_dict.get("chunk_files", []),
                 warnings=bundle_dict.get("warnings", []),
             )
             
             # 5. Guardar bundle en staging
             bundle_path = self.bundle_store.save_phase1_bundle(bundle, status="pending")
-            logger.info(f"  Bundle guardado: {bundle_path.name}")
+            logger.info(f"  ✅ Bundle guardado: {bundle_path.name}")
             
-            # 6. Guardar clase ordenada
-            # --- FIX: Usar notación de punto para acceder al objeto Pydantic ---
-            lesson_filename = f"{bundle.source_metadata.source_id}.md"
-            lesson_path = self.lessons_ordered_path / lesson_filename
-            with open(lesson_path, "w", encoding="utf-8") as f:
-                f.write(bundle.ordered_class_markdown)
-            logger.info(f"  Lección ordenada: {lesson_filename}")
+            # 6. Log de productos generados
+            if bundle.draft_path:
+                logger.info(f"  📝 Draft: {bundle.draft_path}")
+            if bundle.section_notes_dir:
+                logger.info(f"  📁 Notas: {bundle.section_notes_dir}")
             
-            # 7. Guardar chunks como JSON
-            # --- FIX: Usar notación de punto aquí también ---
-            chunks_filename = f"{bundle.source_metadata.source_id}_chunks.json"
-            chunks_path = self.lessons_chunks_path / chunks_filename
-            
-            # Convertir chunks (objetos Pydantic) a dicts para JSON
-            chunks_data = [chunk.model_dump() for chunk in bundle.semantic_chunks]
-            
-            with open(chunks_path, "w", encoding="utf-8") as f:
-                json.dump(chunks_data, f, indent=2, ensure_ascii=False)
+            # 7. Estadísticas del plan
+            if bundle.master_plan:
+                plan = bundle.master_plan
+                topic_count = len(plan.get("topics", []))
+                risk_count = len(plan.get("detected_risks", []))
+                logger.info(f"  📊 Plan: {topic_count} temas, {risk_count} riesgos detectados")
             
             # 8. Actualizar registro
             self.processed_hashes[str(file_path)] = self._get_file_hash(file_path)
             self._save_state()
             
-            # 9. Mover archivo original a processed
+            # 9. Mover archivo a processed
             processed_file = self.processed_path / file_path.name
             shutil.move(str(file_path), str(processed_file))
-            logger.info(f"  Archivo movido a processed/")
+            logger.info(f"  📦 Archivo movido a processed/")
             
             return True
             
         except Exception as e:
-            logger.exception(f"Error procesando {file_path.name}: {e}")
+            logger.exception(f"  ❌ Error procesando {file_path.name}: {e}")
             return False
     
     def run_once(self) -> int:
+        """
+        Ejecuta un ciclo de procesamiento.
+        
+        Returns:
+            Número de archivos procesados
+        """
         files = self.scan_inbox()
+        
         if not files:
             return 0
         
-        logger.info(f"Encontrados {len(files)} archivo(s) para procesar")
+        logger.info(f"📥 Encontrados {len(files)} archivo(s) para procesar")
+        
         processed_count = 0
         for file_path in files:
             if self.process_file(file_path):
                 processed_count += 1
+        
         return processed_count
     
     def run_forever(self, interval: int = 30) -> None:
-        logger.info(f"Iniciando watcher (intervalo: {interval}s)")
-        logger.info(f"Vigilando: {self.inbox_path}")
+        """
+        Ejecuta el watcher en loop infinito.
+        
+        Args:
+            interval: Segundos entre escaneos
+        """
+        logger.info(f"🔄 Iniciando watcher V2 (intervalo: {interval}s)")
+        logger.info(f"📂 Vigilando: {self.inbox_path}")
         
         while True:
             try:
                 count = self.run_once()
                 if count > 0:
-                    logger.info(f"Procesados {count} archivo(s)")
+                    logger.info(f"✨ Procesados {count} archivo(s)")
             except KeyboardInterrupt:
-                logger.info("Detenido por usuario")
+                logger.info("🛑 Detenido por usuario")
                 break
             except Exception as e:
                 logger.exception(f"Error en ciclo de escaneo: {e}")
@@ -225,11 +250,31 @@ class Phase1Watcher:
             time.sleep(interval)
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="Watcher de Phase 1")
-    parser.add_argument("--base-path", type=str, default="./data")
-    parser.add_argument("--interval", type=int, default=30)
-    parser.add_argument("--once", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Watcher de Phase 1 V2 - Arquitectura Paralela"
+    )
+    parser.add_argument(
+        "--base-path",
+        type=str,
+        default="./data",
+        help="Ruta base del proyecto (default: ./data)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=30,
+        help="Segundos entre escaneos (default: 30)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Ejecutar una sola vez y salir",
+    )
     
     args = parser.parse_args()
     
@@ -240,6 +285,7 @@ def main():
         logger.info(f"Procesados {count} archivo(s)")
     else:
         watcher.run_forever(args.interval)
+
 
 if __name__ == "__main__":
     main()
