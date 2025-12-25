@@ -1,0 +1,3 @@
+## Criterios de comportamiento esperado: respuestas dentro de dominio y manejo de falta de información
+
+[Sin contenido]

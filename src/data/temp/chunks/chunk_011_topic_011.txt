@@ -1,0 +1,3 @@
+## Patrones de coordinación multiagente aplicados a evaluación: voto, consenso y debate
+
+[Sin contenido]

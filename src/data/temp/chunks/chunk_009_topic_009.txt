@@ -1,0 +1,3 @@
+## Métricas de calidad en RAG: groundedness y relevance (y fallas típicas)
+
+[Sin contenido]

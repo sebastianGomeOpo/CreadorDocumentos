@@ -185,12 +185,23 @@ def chunk_persister_node(state: Phase1State) -> dict[str, Any]:
 # NODO 3: DISPATCHER (genera Send() para paralelo)
 # =============================================================================
 
-def dispatcher_node(state: Phase1State) -> list[Send]:
+# =============================================================================
+# NODO 3: DISPATCHER (Separado en Nodo y Lógica de Borde)
+# =============================================================================
+
+def dispatcher_node(state: Phase1State) -> dict[str, Any]:
     """
-    Nodo 3: Dispatcher - genera tareas paralelas.
-    
-    Este nodo NO retorna un dict, retorna una lista de Send().
-    Cada Send() dispara una instancia del writer_agent.
+    Nodo 3: Dispatcher (Passthrough).
+    Solo marca el paso por este nodo. La lógica real está en el conditional_edge.
+    """
+    return {
+        "current_node": "dispatcher"
+    }
+
+def generate_writer_tasks(state: Phase1State) -> list[Send]:
+    """
+    Lógica de Borde Condicional.
+    Genera la lista de Send() para ejecutar writer_agent en paralelo.
     """
     plan_dict = state["master_plan"]
     plan = MasterPlan(**plan_dict)
@@ -215,7 +226,6 @@ def dispatcher_node(state: Phase1State) -> list[Send]:
         sends.append(Send("writer_agent", task_state))
     
     return sends
-
 
 # =============================================================================
 # NODO 4: WRITER AGENT (ejecuta en paralelo)
@@ -381,7 +391,7 @@ def build_phase1_graph() -> StateGraph:
         Grafo compilado listo para ejecutar
     """
     # Usar estado con reducer para fan-in
-    graph = StateGraph(Phase1State)
+    graph = StateGraph(Phase1StateV2)
     
     # Agregar nodos
     graph.add_node("master_planner", master_planner_node)
@@ -398,11 +408,11 @@ def build_phase1_graph() -> StateGraph:
     graph.add_edge("chunk_persister", "dispatcher")
     
     # Dispatcher genera Send() → writer_agent (paralelo)
-    # El edge condicional retorna lista de Send()
+    # CORRECCIÓN: Usar 'generate_writer_tasks' como la función lógica del borde
     graph.add_conditional_edges(
         "dispatcher",
-        dispatcher_node,  # Esta función retorna list[Send]
-        ["writer_agent"],  # Nodos destino posibles
+        generate_writer_tasks,  # <--- USAR LA NUEVA FUNCIÓN AQUÍ
+        ["writer_agent"],       # Nodos destino posibles
     )
     
     # Writers convergen en collector
