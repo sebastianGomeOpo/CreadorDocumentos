@@ -1,3 +1,0 @@
-## Evaluación comparativa (benchmarking) entre implementaciones y arquitecturas de agentes
-
-[Sin contenido]

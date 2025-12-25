@@ -1,12 +1,12 @@
 """
-Phase 1 Logic Module V2
------------------------
-Arquitectura paralela para procesamiento de contenido.
+Phase 1 Logic Module V2.1
+-------------------------
+Arquitectura paralela con RAG para procesamiento de contenido.
 
 Componentes:
 - master_planner: Genera el MasterPlan con directivas
-- chunk_persister: Persiste chunks a disco
-- writer_agent: Redactor aislado con contexto mínimo
+- context_indexer: Crea índice vectorial para RAG (reemplaza chunk_persister)
+- writer_agent: Redactor con búsqueda RAG
 - assembler: Ensambla resultados en productos finales
 """
 
@@ -14,11 +14,12 @@ from core.logic.phase1.master_planner import (
     create_master_plan,
     run_master_planner,
 )
-from core.logic.phase1.chunk_persister import (
-    persist_chunks_to_disk,
-    read_chunk_from_disk,
-    cleanup_temp_chunks,
-    ChunkPersister,
+from core.logic.phase1.context_indexer import (
+    index_content_for_rag,
+    search_context,
+    cleanup_vector_db,
+    ContextIndexer,
+    TopicRetriever,
 )
 from core.logic.phase1.writer_agent import (
     run_writer_agent,
@@ -34,11 +35,12 @@ __all__ = [
     "create_master_plan",
     "run_master_planner",
     
-    # Chunk Persister
-    "persist_chunks_to_disk",
-    "read_chunk_from_disk",
-    "cleanup_temp_chunks",
-    "ChunkPersister",
+    # Context Indexer (V2.1 - RAG)
+    "index_content_for_rag",
+    "search_context",
+    "cleanup_vector_db",
+    "ContextIndexer",
+    "TopicRetriever",
     
     # Writer Agent
     "run_writer_agent",

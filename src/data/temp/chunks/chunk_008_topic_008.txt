@@ -1,3 +1,0 @@
-## Evaluación con datasets de preguntas-respuestas y métricas automáticas con LLM
-
-[Sin contenido]

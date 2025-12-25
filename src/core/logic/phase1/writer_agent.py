@@ -1,25 +1,25 @@
 """
-writer_agent.py — El Redactor Aislado
+writer_agent.py — El Redactor con RAG
 
-Un agente de redacción que opera con contexto MÍNIMO.
-Solo ve SU chunk, sus directivas, y el mapa de navegación.
+Un agente de redacción que BUSCA activamente su contexto usando RAG.
+En lugar de recibir un chunk pre-cortado, recupera información relevante.
 
-PRINCIPIO FUNDAMENTAL:
-"Lo que no está en mi contexto, no puede contaminar mi salida"
+PRINCIPIO FUNDAMENTAL V2:
+"Pull vs Push" — El agente jala lo que necesita en lugar de recibir un corte arbitrario.
 
 RESPONSABILIDAD:
-- Leer UN chunk desde disco
-- Aplicar directivas must_include/must_exclude
-- Usar contexto de navegación para transiciones
+- Recibir directivas del tema (nombre, must_include, must_exclude)
+- BUSCAR contexto relevante en la base vectorial
+- Aplicar directivas de contención
 - Generar markdown limpio y coherente
 
-AISLAMIENTO:
-- NO tiene acceso al contenido de otros chunks
-- NO tiene acceso al texto completo de la clase
-- Su ventana de contexto está prístina
+VENTAJAS RAG:
+- Independencia del formato original
+- Recupera contexto incluso si está disperso
+- No depende de heurísticas de corte
 
 CONEXIONES:
-- Input: chunk_path + directives + navigation_context
+- Input: source_id + topic_directives + navigation_context
 - Output: WriterResult con markdown compilado
 - Llamado por: phase1_graph.py via Send() (paralelo)
 """
@@ -47,6 +47,8 @@ load_dotenv()
 
 MAX_RETRIES = 2
 DEFAULT_WORD_TARGET = 300
+DEFAULT_VECTOR_DB_DIR = Path("data/temp/vector_db")
+DEFAULT_K = 8  # Chunks a recuperar por búsqueda
 
 
 # =============================================================================
@@ -79,7 +81,7 @@ REGLAS INQUEBRANTABLES:
    - Si hay un tema siguiente, puedes anticiparlo sutilmente al final
 
 5. TONO
-   - Blog Divulgativo Tecnico pero accesible
+   - Académico pero accesible
    - Directo, sin muletillas
    - Evita redundancias
 
@@ -106,9 +108,9 @@ WRITER_USER_TEMPLATE = """## INFORMACIÓN DE TU SECCIÓN
 **KEY_CONCEPTS (conceptos clave del tema):**
 {key_concepts}
 
-### CONTENIDO CRUDO A REDACTAR
+### CONTEXTO RECUPERADO (información relevante del documento original)
 
-{chunk_content}
+{retrieved_context}
 
 ---
 
@@ -117,6 +119,7 @@ Ahora redacta la sección. Recuerda:
 - Incluye todos los MUST_INCLUDE
 - Evita mencionar cualquier MUST_EXCLUDE
 - Mantén el foco en TU tema
+- Usa SOLO la información del contexto recuperado
 """
 
 
@@ -137,18 +140,12 @@ def get_llm() -> BaseChatModel | None:
         
         return ChatOpenAI(
             model=model,
-            temperature=0.3,  # Un poco de creatividad para redacción
+            temperature=0.3,
             api_key=api_key
         )
     except Exception as e:
         print(f"Error inicializando LLM: {e}")
         return None
-
-
-def read_chunk(chunk_path: str | Path) -> str:
-    """Lee un chunk desde disco."""
-    with open(chunk_path, "r", encoding="utf-8") as f:
-        return f.read()
 
 
 def format_list(items: list[str]) -> str:
@@ -201,45 +198,114 @@ def validate_output(
 
 
 # =============================================================================
+# RECUPERACIÓN DE CONTEXTO (RAG)
+# =============================================================================
+
+def retrieve_context_for_topic(
+    source_id: str,
+    topic_name: str,
+    key_concepts: list[str],
+    must_include: list[str],
+    db_path: Path | str = DEFAULT_VECTOR_DB_DIR,
+    k: int = DEFAULT_K,
+) -> str:
+    """
+    Recupera contexto relevante para un tema usando RAG.
+    
+    Estrategia de búsqueda múltiple:
+    1. Buscar por nombre del tema
+    2. Buscar por conceptos clave
+    3. Buscar por must_include
+    4. Combinar y deduplicar
+    
+    Args:
+        source_id: ID de la fuente
+        topic_name: Nombre del tema
+        key_concepts: Conceptos clave
+        must_include: Términos obligatorios
+        db_path: Ruta a la base vectorial
+        k: Chunks a recuperar por búsqueda
+        
+    Returns:
+        Contexto concatenado
+    """
+    try:
+        from core.logic.phase1.context_indexer import ContextIndexer
+        
+        indexer = ContextIndexer(db_path)
+        all_chunks = set()
+        
+        # Búsqueda 1: Por nombre del tema
+        docs1 = indexer.search(source_id, topic_name, k=k)
+        for doc in docs1:
+            all_chunks.add(doc.page_content)
+        
+        # Búsqueda 2: Por conceptos clave (si existen)
+        if key_concepts:
+            query2 = " ".join(key_concepts[:5])
+            docs2 = indexer.search(source_id, query2, k=k // 2)
+            for doc in docs2:
+                all_chunks.add(doc.page_content)
+        
+        # Búsqueda 3: Por must_include (si existen)
+        if must_include:
+            query3 = " ".join(must_include[:3])
+            docs3 = indexer.search(source_id, query3, k=k // 2)
+            for doc in docs3:
+                all_chunks.add(doc.page_content)
+        
+        # Combinar con separadores
+        if all_chunks:
+            return "\n\n---\n\n".join(sorted(all_chunks, key=len, reverse=True))
+        else:
+            return "[No se encontró contexto relevante en el documento]"
+            
+    except Exception as e:
+        return f"[Error recuperando contexto: {str(e)}]"
+
+
+def read_chunk_fallback(chunk_path: str | Path) -> str:
+    """Fallback: lee un chunk desde disco si existe."""
+    try:
+        with open(chunk_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+# =============================================================================
 # REDACCIÓN HEURÍSTICA (sin LLM)
 # =============================================================================
 
 def write_section_heuristic(
-    chunk_content: str,
+    context: str,
     topic_name: str,
     navigation: NavigationContext | None,
 ) -> str:
     """
     Fallback heurístico para redacción sin LLM.
-    Limpia el texto y añade estructura básica.
     """
+    import re
     lines = []
     
-    # Header
     lines.append(f"## {topic_name}")
     lines.append("")
     
-    # Transición inicial si hay tema anterior
     if navigation and navigation.previous_topic:
         lines.append(f"Continuando desde {navigation.previous_topic}, ahora exploraremos este tema.")
         lines.append("")
     
-    # Contenido (limpieza básica)
-    content = chunk_content
-    
-    # Remover headers duplicados
-    import re
-    content = re.sub(r'^#{1,3}\s+.*$', '', content, flags=re.MULTILINE)
+    # Limpiar contexto
+    content = re.sub(r'^#{1,3}\s+.*$', '', context, flags=re.MULTILINE)
     content = content.strip()
     
-    if content:
-        lines.append(content)
+    if content and content != "[No se encontró contexto relevante en el documento]":
+        lines.append(content[:2000])  # Limitar
     else:
         lines.append("*[Contenido pendiente de desarrollo]*")
     
     lines.append("")
     
-    # Transición final si hay tema siguiente
     if navigation and navigation.next_topic:
         lines.append(f"En la siguiente sección, abordaremos {navigation.next_topic}.")
     
@@ -251,7 +317,7 @@ def write_section_heuristic(
 # =============================================================================
 
 def write_section_llm(
-    chunk_content: str,
+    retrieved_context: str,
     topic_name: str,
     sequence_id: int,
     total_sections: int,
@@ -262,26 +328,10 @@ def write_section_llm(
     llm: BaseChatModel,
 ) -> str:
     """
-    Redacta una sección usando el LLM.
-    
-    Args:
-        chunk_content: Contenido crudo del chunk
-        topic_name: Nombre del tema
-        sequence_id: Posición en la secuencia
-        total_sections: Total de secciones
-        must_include: Conceptos obligatorios
-        must_exclude: Conceptos prohibidos
-        key_concepts: Conceptos clave
-        navigation: Contexto de navegación
-        llm: Modelo de lenguaje
-        
-    Returns:
-        Markdown de la sección
+    Redacta una sección usando el LLM con contexto RAG.
     """
-    # Preparar contexto de navegación
     nav_hint = navigation.get_transition_hint() if navigation else "Sección estándar"
     
-    # Construir prompt
     user_prompt = WRITER_USER_TEMPLATE.format(
         topic_name=topic_name,
         sequence_id=sequence_id,
@@ -290,7 +340,7 @@ def write_section_llm(
         must_include=format_list(must_include),
         must_exclude=format_list(must_exclude),
         key_concepts=format_list(key_concepts),
-        chunk_content=chunk_content[:8000],  # Límite de seguridad
+        retrieved_context=retrieved_context[:12000],  # Límite de contexto
     )
     
     messages = [
@@ -310,10 +360,10 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
     """
     Ejecuta un Writer Agent para una tarea específica.
     
-    Esta función es el punto de entrada para cada instancia paralela.
+    V2: Ahora usa RAG para recuperar contexto en lugar de leer chunks.
     
     Args:
-        task: Estado de la tarea con toda la información necesaria
+        task: Estado de la tarea
         
     Returns:
         WriterResult con el markdown y metadata
@@ -321,7 +371,6 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
     start_time = time.time()
     
     # Extraer datos del task
-    chunk_path = task["chunk_path"]
     sequence_id = task["sequence_id"]
     topic_id = task["topic_id"]
     topic_name = task["topic_name"]
@@ -330,14 +379,34 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
     key_concepts = task.get("key_concepts", [])
     nav_dict = task.get("navigation_context", {})
     
-    # Reconstruir NavigationContext si existe
+    # V2: Nuevos campos para RAG
+    source_id = task.get("source_id", "")
+    db_path = task.get("db_path", str(DEFAULT_VECTOR_DB_DIR))
+    
+    # Fallback a chunk_path si existe (compatibilidad)
+    chunk_path = task.get("chunk_path", "")
+    
+    # Reconstruir NavigationContext
     navigation = None
     if nav_dict:
         navigation = NavigationContext(**nav_dict)
     
     try:
-        # 1. Leer chunk desde disco (contexto mínimo)
-        chunk_content = read_chunk(chunk_path)
+        # 1. RECUPERAR CONTEXTO
+        if source_id:
+            # V2: Usar RAG
+            context = retrieve_context_for_topic(
+                source_id=source_id,
+                topic_name=topic_name,
+                key_concepts=key_concepts,
+                must_include=must_include,
+                db_path=db_path,
+            )
+        elif chunk_path:
+            # Fallback V1: Leer chunk físico
+            context = read_chunk_fallback(chunk_path)
+        else:
+            context = "[Sin contexto disponible]"
         
         # 2. Obtener LLM
         llm = get_llm()
@@ -345,7 +414,7 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
         # 3. Redactar sección
         if llm:
             compiled_markdown = write_section_llm(
-                chunk_content=chunk_content,
+                retrieved_context=context,
                 topic_name=topic_name,
                 sequence_id=sequence_id,
                 total_sections=navigation.total_sections if navigation else 1,
@@ -357,7 +426,7 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
             )
         else:
             compiled_markdown = write_section_heuristic(
-                chunk_content=chunk_content,
+                context=context,
                 topic_name=topic_name,
                 navigation=navigation,
             )
@@ -390,7 +459,6 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
     except Exception as e:
         processing_time = int((time.time() - start_time) * 1000)
         
-        # Fallback con contenido mínimo
         fallback_md = f"## {topic_name}\n\n*[Error durante la redacción: {str(e)}]*"
         
         return WriterResult(
@@ -415,12 +483,6 @@ def run_writer_agent(task: WriterTaskState) -> WriterResult:
 def writer_node(state: WriterTaskState) -> dict[str, Any]:
     """
     Wrapper del writer para usar como nodo en LangGraph.
-    
-    Args:
-        state: Estado de la tarea (WriterTaskState)
-        
-    Returns:
-        Diccionario con el resultado serializado
     """
     result = run_writer_agent(state)
     return result.model_dump()

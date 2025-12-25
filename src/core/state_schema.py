@@ -430,8 +430,8 @@ class Phase2Bundle(BaseModel):
 
 class Phase1State(TypedDict, total=False):
     """
-    Estado que fluye por Phase1Graph V2.
-    Soporta arquitectura paralela con Send().
+    Estado que fluye por Phase1Graph V2.1.
+    Soporta arquitectura paralela con Send() y RAG.
     """
     # Input
     source_path: str
@@ -441,8 +441,13 @@ class Phase1State(TypedDict, total=False):
     # V2: Plan maestro
     master_plan: dict
     
-    # V2: Rutas a chunks en disco
+    # V2.0: Rutas a chunks en disco (legacy, aún soportado)
     chunk_paths: list[str]
+    
+    # V2.1: RAG fields
+    db_path: str           # Ruta a la base vectorial
+    index_stats: dict      # Estadísticas del indexador
+    writer_tasks: list     # Tareas preparadas para dispatch
     
     # V2: Resultados de writers (acumulados por fan-in)
     writer_results: list[dict]
@@ -469,8 +474,10 @@ class WriterTaskState(TypedDict, total=False):
     """
     Estado efímero para un Writer Agent individual.
     Se crea por cada Send() y se destruye al terminar.
+    
+    V2.1: Añadidos campos para RAG (source_id, db_path)
     """
-    # Input mínimo
+    # Input mínimo (legacy - compatibilidad V2.0)
     chunk_path: str
     sequence_id: int
     topic_id: str
@@ -483,6 +490,10 @@ class WriterTaskState(TypedDict, total=False):
     
     # Contexto de navegación
     navigation_context: dict
+    
+    # V2.1: Campos para RAG
+    source_id: str  # ID de la fuente para buscar en la DB
+    db_path: str    # Ruta a la base de datos vectorial
     
     # Output
     compiled_markdown: str

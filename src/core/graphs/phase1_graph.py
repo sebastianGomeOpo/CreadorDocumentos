@@ -1,52 +1,54 @@
 """
-phase1_graph.py — Grafo LangGraph V2 con Arquitectura Paralela
+phase1_graph.py — Grafo LangGraph V2.1 con RAG
 
 Este grafo transforma una transcripción/texto crudo en una
 "clase ordenada" lista para revisión humana.
 
-ARQUITECTURA V2:
+ARQUITECTURA V2.1 (RAG):
 - Planificación secuencial (MasterPlan)
-- Persistencia a disco (liberar RAM)
-- Redacción paralela (Send/Map)
+- INDEXACIÓN VECTORIAL (reemplaza chunk_persister)
+- Redacción paralela con RETRIEVAL (Pull vs Push)
 - Ensamblaje (Fan-in)
+
+CAMBIOS VS V2.0:
+- context_indexer reemplaza a chunk_persister
+- Writers buscan contexto via RAG en lugar de leer archivos
+- Corregido InvalidUpdateError: dispatcher separado de bifurcación
+- Corregido concurrencia: Phase1StateV2 con reducer apropiado
 
 NODOS:
 1. master_planner     → Genera MasterPlan con directivas
-2. chunk_persister    → Guarda chunks en disco, limpia RAM
-3. dispatcher         → Crea tareas y dispara Send()
-4. writer_agent       → [PARALELO] Redacta una sección
+2. context_indexer    → Crea índice vectorial (ChromaDB)
+3. dispatch_prepare   → Prepara tareas (no bifurca)
+4. writer_agent       → [PARALELO] Redacta con RAG
 5. collector          → [FAN-IN] Recolecta resultados
 6. assembler          → Ensambla documento final
 7. bundle_creator     → Serializa para revisión
 
 FLUJO:
-    START → master_planner → chunk_persister → dispatcher
-                                                   │
-                                          ┌───────┴───────┐
-                                          │  Send() MAP   │
-                                          └───────────────┘
-                                                   │
-                                    ┌──────────────┼──────────────┐
-                                    ▼              ▼              ▼
-                              writer_agent   writer_agent   writer_agent
-                                    │              │              │
-                                    └──────────────┼──────────────┘
-                                                   │
-                                          ┌───────┴───────┐
-                                          │   collector   │
-                                          │   (Fan-in)    │
-                                          └───────────────┘
-                                                   │
-                                                   ▼
-                                             assembler
-                                                   │
-                                                   ▼
-                                           bundle_creator → END
-
-CONEXIONES:
-- Usa: core/state_schema.py (Phase1State, WriterTaskState)
-- Usa: core/logic/phase1/ (módulos de lógica)
-- Escribe: data/staging/phase1_pending/
+    START → master_planner → context_indexer → dispatch_prepare
+                                                       │
+                                              ┌────────┴────────┐
+                                              │   Send() MAP    │
+                                              └─────────────────┘
+                                                       │
+                                    ┌──────────────────┼──────────────────┐
+                                    ▼                  ▼                  ▼
+                              writer_agent       writer_agent       writer_agent
+                                (RAG query)       (RAG query)       (RAG query)
+                                    │                  │                  │
+                                    └──────────────────┼──────────────────┘
+                                                       │
+                                              ┌────────┴────────┐
+                                              │    collector    │
+                                              │    (Fan-in)     │
+                                              └─────────────────┘
+                                                       │
+                                                       ▼
+                                                  assembler
+                                                       │
+                                                       ▼
+                                               bundle_creator → END
 """
 
 from __future__ import annotations
@@ -56,7 +58,7 @@ import operator
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Sequence
+from typing import Annotated, Any, Literal, Sequence
 
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
@@ -72,7 +74,7 @@ from core.state_schema import (
 )
 
 from core.logic.phase1.master_planner import create_master_plan
-from core.logic.phase1.chunk_persister import persist_chunks_to_disk, cleanup_temp_chunks
+from core.logic.phase1.context_indexer import index_content_for_rag, cleanup_vector_db
 from core.logic.phase1.writer_agent import run_writer_agent
 from core.logic.phase1.assembler import run_assembler
 
@@ -84,18 +86,18 @@ load_dotenv()
 # =============================================================================
 
 DATA_BASE_PATH = Path(os.getenv("DATA_PATH", "./data"))
-CHUNKS_DIR = DATA_BASE_PATH / "temp" / "chunks"
+VECTOR_DB_DIR = DATA_BASE_PATH / "temp" / "vector_db"
 DRAFTS_DIR = DATA_BASE_PATH / "drafts"
 NOTES_DIR = DATA_BASE_PATH / "section_notes"
 
 
 # =============================================================================
-# ESTADO CON REDUCER PARA FAN-IN
+# ESTADO V2.1 CON REDUCER PARA FAN-IN
 # =============================================================================
 
 def add_writer_results(
-    existing: list[dict],
-    new: list[dict] | dict,
+    existing: list[dict] | None,
+    new: list[dict] | dict | None,
 ) -> list[dict]:
     """
     Reducer que acumula resultados de writers.
@@ -104,23 +106,36 @@ def add_writer_results(
     if existing is None:
         existing = []
     
+    if new is None:
+        return existing
+    
     if isinstance(new, dict):
         return existing + [new]
     elif isinstance(new, list):
         return existing + new
+    
     return existing
 
 
 class Phase1StateV2(Phase1State):
-    """Estado extendido con reducer para writer_results."""
+    """
+    Estado extendido con:
+    - Reducer para writer_results (fan-in)
+    - Campos para RAG (db_path, source_id accesible)
+    """
+    # El Annotated con reducer permite acumulación desde nodos paralelos
     writer_results: Annotated[list[dict], add_writer_results]
+    
+    # V2.1: Campos adicionales para RAG
+    db_path: str  # Ruta a la base vectorial
+    index_stats: dict  # Estadísticas del indexador
 
 
 # =============================================================================
 # NODO 1: MASTER PLANNER
 # =============================================================================
 
-def master_planner_node(state: Phase1State) -> dict[str, Any]:
+def master_planner_node(state: dict) -> dict[str, Any]:
     """
     Nodo 1: Genera el MasterPlan.
     
@@ -128,10 +143,9 @@ def master_planner_node(state: Phase1State) -> dict[str, Any]:
     Output: master_plan (serializado)
     """
     raw_content = state["raw_content"]
-    source_meta = state["source_metadata"]
+    source_meta = state.get("source_metadata", {})
     source_id = source_meta.get("source_id", generate_source_id(raw_content))
     
-    # Crear plan
     plan = create_master_plan(raw_content, source_id)
     
     return {
@@ -141,102 +155,127 @@ def master_planner_node(state: Phase1State) -> dict[str, Any]:
 
 
 # =============================================================================
-# NODO 2: CHUNK PERSISTER
+# NODO 2: CONTEXT INDEXER (reemplaza chunk_persister)
 # =============================================================================
 
-def chunk_persister_node(state: Phase1State) -> dict[str, Any]:
+def context_indexer_node(state: dict) -> dict[str, Any]:
     """
-    Nodo 2: Persiste chunks a disco y limpia RAM.
+    Nodo 2: Crea índice vectorial del contenido.
     
-    Input: raw_content, master_plan
-    Output: chunk_paths
+    REEMPLAZA a chunk_persister.
+    En lugar de cortar archivos, crea una DB vectorial para búsqueda semántica.
+    
+    Input: raw_content, source_metadata
+    Output: db_path, index_stats
     """
     raw_content = state["raw_content"]
-    plan_dict = state["master_plan"]
+    source_meta = state.get("source_metadata", {})
+    source_id = source_meta.get("source_id", generate_source_id(raw_content))
     
-    # Reconstruir MasterPlan
-    plan = MasterPlan(**plan_dict)
-    
-    # Persistir chunks
-    chunk_infos = persist_chunks_to_disk(
+    # Crear índice vectorial
+    stats = index_content_for_rag(
         raw_content=raw_content,
-        master_plan=plan,
-        base_path=CHUNKS_DIR,
+        source_id=source_id,
+        base_path=VECTOR_DB_DIR,
     )
     
-    # Actualizar plan con rutas a chunks
-    for info in chunk_infos:
+    return {
+        "db_path": stats["db_path"],
+        "index_stats": stats,
+        "current_node": "context_indexer",
+    }
+
+
+# =============================================================================
+# NODO 3: DISPATCH PREPARE (prepara tareas, NO bifurca)
+# =============================================================================
+
+def dispatch_prepare_node(state: dict) -> dict[str, Any]:
+    """
+    Nodo 3: Prepara las tareas para los writers.
+    
+    IMPORTANTE: Este nodo NO bifurca. Solo prepara los datos.
+    La bifurcación ocurre en dispatch_to_writers (conditional edge).
+    
+    Esto evita el error InvalidUpdateError.
+    """
+    plan_dict = state.get("master_plan", {})
+    source_meta = state.get("source_metadata", {})
+    source_id = source_meta.get("source_id", "")
+    db_path = state.get("db_path", str(VECTOR_DB_DIR))
+    
+    # Preparar lista de tareas (se usará en dispatch_to_writers)
+    tasks = []
+    
+    if plan_dict:
+        plan = MasterPlan(**plan_dict)
+        
         for topic in plan.topics:
-            if topic.sequence_id == info["sequence_id"]:
-                topic.chunk_path = info["chunk_path"]
-                break
-    
-    # Extraer solo las rutas
-    chunk_paths = [info["chunk_path"] for info in chunk_infos]
+            task = {
+                "sequence_id": topic.sequence_id,
+                "topic_id": topic.topic_id,
+                "topic_name": topic.topic_name,
+                "must_include": topic.must_include,
+                "must_exclude": topic.must_exclude,
+                "key_concepts": topic.key_concepts,
+                "navigation_context": topic.navigation.model_dump() if topic.navigation else {},
+                # V2.1: Campos para RAG
+                "source_id": source_id,
+                "db_path": db_path,
+            }
+            tasks.append(task)
     
     return {
-        "chunk_paths": chunk_paths,
-        "master_plan": plan.model_dump(),  # Plan actualizado con rutas
-        "current_node": "chunk_persister",
+        "writer_tasks": tasks,  # Se usa en dispatch_to_writers
+        "current_node": "dispatch_prepare",
     }
 
 
 # =============================================================================
-# NODO 3: DISPATCHER (genera Send() para paralelo)
+# FUNCIÓN DE BIFURCACIÓN (conditional edge, NO es nodo)
 # =============================================================================
 
-# =============================================================================
-# NODO 3: DISPATCHER (Separado en Nodo y Lógica de Borde)
-# =============================================================================
-
-def dispatcher_node(state: Phase1State) -> dict[str, Any]:
+def dispatch_to_writers(state: dict) -> list[Send]:
     """
-    Nodo 3: Dispatcher (Passthrough).
-    Solo marca el paso por este nodo. La lógica real está en el conditional_edge.
-    """
-    return {
-        "current_node": "dispatcher"
-    }
-
-def generate_writer_tasks(state: Phase1State) -> list[Send]:
-    """
-    Lógica de Borde Condicional.
-    Genera la lista de Send() para ejecutar writer_agent en paralelo.
-    """
-    plan_dict = state["master_plan"]
-    plan = MasterPlan(**plan_dict)
+    Función de bifurcación que genera Send() para cada tarea.
     
-    # Crear una tarea por cada topic
+    Esta función se usa como conditional_edge, NO como nodo.
+    Retorna lista de Send() que disparan writer_agent en paralelo.
+    """
+    tasks = state.get("writer_tasks", [])
+    
     sends = []
-    
-    for topic in plan.topics:
-        # Construir estado mínimo para el writer
+    for task in tasks:
+        # Construir WriterTaskState
         task_state: WriterTaskState = {
-            "chunk_path": topic.chunk_path,
-            "sequence_id": topic.sequence_id,
-            "topic_id": topic.topic_id,
-            "topic_name": topic.topic_name,
-            "must_include": topic.must_include,
-            "must_exclude": topic.must_exclude,
-            "key_concepts": topic.key_concepts,
-            "navigation_context": topic.navigation.model_dump() if topic.navigation else {},
+            "chunk_path": "",  # No usado en V2.1
+            "sequence_id": task["sequence_id"],
+            "topic_id": task["topic_id"],
+            "topic_name": task["topic_name"],
+            "must_include": task.get("must_include", []),
+            "must_exclude": task.get("must_exclude", []),
+            "key_concepts": task.get("key_concepts", []),
+            "navigation_context": task.get("navigation_context", {}),
+            # V2.1: RAG fields
+            "source_id": task.get("source_id", ""),
+            "db_path": task.get("db_path", ""),
         }
         
-        # Disparar writer_agent con este estado
         sends.append(Send("writer_agent", task_state))
     
     return sends
 
+
 # =============================================================================
-# NODO 4: WRITER AGENT (ejecuta en paralelo)
+# NODO 4: WRITER AGENT (ejecuta en paralelo con RAG)
 # =============================================================================
 
 def writer_agent_node(state: WriterTaskState) -> dict[str, Any]:
     """
-    Nodo 4: Writer Agent - redacta una sección.
+    Nodo 4: Writer Agent - redacta una sección usando RAG.
     
+    V2.1: Ahora BUSCA contexto en la base vectorial en lugar de leer archivo.
     Se ejecuta N veces en paralelo, una por cada Send().
-    Recibe WriterTaskState, retorna resultado para el collector.
     """
     result = run_writer_agent(state)
     
@@ -247,21 +286,21 @@ def writer_agent_node(state: WriterTaskState) -> dict[str, Any]:
 
 
 # =============================================================================
-# NODO 5: COLLECTOR (fan-in implícito)
+# NODO 5: COLLECTOR (fan-in)
 # =============================================================================
 
-def collector_node(state: Phase1State) -> dict[str, Any]:
+def collector_node(state: dict) -> dict[str, Any]:
     """
     Nodo 5: Collector - punto de sincronización.
     
-    Este nodo existe para marcar el punto de fan-in.
     Los resultados ya están acumulados en writer_results por el reducer.
+    Este nodo marca el fin del paralelismo.
     """
     writer_results = state.get("writer_results", [])
     
     return {
         "current_node": "collector",
-        # Los writer_results ya están acumulados
+        # writer_results ya acumulados
     }
 
 
@@ -269,19 +308,15 @@ def collector_node(state: Phase1State) -> dict[str, Any]:
 # NODO 6: ASSEMBLER
 # =============================================================================
 
-def assembler_node(state: Phase1State) -> dict[str, Any]:
+def assembler_node(state: dict) -> dict[str, Any]:
     """
     Nodo 6: Assembler - ensambla documento final.
-    
-    Input: writer_results, master_plan
-    Output: draft_path, section_notes_dir, ordered_class_markdown
     """
     writer_results = state.get("writer_results", [])
     plan_dict = state.get("master_plan", {})
-    source_meta = state["source_metadata"]
+    source_meta = state.get("source_metadata", {})
     source_id = source_meta.get("source_id", "unknown")
     
-    # Ensamblar
     result = run_assembler(
         writer_results=writer_results,
         source_id=source_id,
@@ -290,12 +325,14 @@ def assembler_node(state: Phase1State) -> dict[str, Any]:
         notes_dir=NOTES_DIR,
     )
     
-    # Leer el draft para ordered_class_markdown
+    # Leer draft para ordered_class_markdown
     draft_path = result["draft_path"]
-    with open(draft_path, "r", encoding="utf-8") as f:
-        ordered_class_markdown = f.read()
+    try:
+        with open(draft_path, "r", encoding="utf-8") as f:
+            ordered_class_markdown = f.read()
+    except Exception:
+        ordered_class_markdown = ""
     
-    # Convertir warnings a formato legacy
     warnings = [
         {"type": "processing", "description": w, "severity": "medium"}
         for w in result.get("warnings", [])
@@ -314,20 +351,17 @@ def assembler_node(state: Phase1State) -> dict[str, Any]:
 # NODO 7: BUNDLE CREATOR
 # =============================================================================
 
-def bundle_creator_node(state: Phase1State) -> dict[str, Any]:
+def bundle_creator_node(state: dict) -> dict[str, Any]:
     """
     Nodo 7: Crea el bundle para revisión humana.
-    
-    Input: Todos los resultados acumulados
-    Output: bundle (serializado)
     """
-    source_meta = state["source_metadata"]
+    source_meta = state.get("source_metadata", {})
     source_id = source_meta.get("source_id", generate_source_id(state.get("raw_content", "")))
     bundle_id = generate_bundle_id(source_id, phase=1)
     
     plan_dict = state.get("master_plan", {})
     
-    # Extraer topics del plan para formato legacy
+    # Extraer topics para formato legacy
     topics = []
     ordered_outline = []
     
@@ -349,25 +383,25 @@ def bundle_creator_node(state: Phase1State) -> dict[str, Any]:
                 "subtopics": topic.key_concepts,
             })
     
-    # Construir bundle
     bundle_dict = {
         "bundle_id": bundle_id,
         "source_metadata": source_meta,
         "raw_content_preview": state.get("raw_content", "")[:500],
         
-        # V2: Plan maestro
+        # V2.1: Plan maestro + RAG stats
         "master_plan": plan_dict,
+        "index_stats": state.get("index_stats", {}),
         
         # Legacy compatibility
         "topics": topics,
         "ordered_outline": ordered_outline,
-        "semantic_chunks": [],  # Ya no usamos chunks en memoria
+        "semantic_chunks": [],
         
         # Productos
         "ordered_class_markdown": state.get("ordered_class_markdown", ""),
         "draft_path": state.get("draft_path", ""),
         "section_notes_dir": state.get("section_notes_dir", ""),
-        "chunk_files": state.get("chunk_paths", []),
+        "chunk_files": [],  # No usado en V2.1
         
         # Warnings
         "warnings": state.get("warnings", []),
@@ -380,23 +414,43 @@ def bundle_creator_node(state: Phase1State) -> dict[str, Any]:
 
 
 # =============================================================================
-# CONSTRUCCIÓN DEL GRAFO
+# CONSTRUCCIÓN DEL GRAFO V2.1
 # =============================================================================
 
 def build_phase1_graph() -> StateGraph:
     """
-    Construye el grafo de Phase 1 V2 con arquitectura paralela.
+    Construye el grafo de Phase 1 V2.1 con RAG.
     
-    Returns:
-        Grafo compilado listo para ejecutar
+    CORRECCIONES:
+    - dispatch_prepare es nodo, dispatch_to_writers es conditional_edge
+    - Esto evita InvalidUpdateError
     """
-    # Usar estado con reducer para fan-in
-    graph = StateGraph(Phase1StateV2)
+    # Usar TypedDict base para evitar problemas de tipado
+    from typing import TypedDict, Optional
+    
+    class GraphState(TypedDict, total=False):
+        source_path: str
+        raw_content: str
+        source_metadata: dict
+        master_plan: dict
+        db_path: str
+        index_stats: dict
+        writer_tasks: list
+        writer_results: Annotated[list[dict], add_writer_results]
+        ordered_class_markdown: str
+        draft_path: str
+        section_notes_dir: str
+        warnings: list
+        bundle: dict
+        current_node: str
+        error: Optional[str]
+    
+    graph = StateGraph(GraphState)
     
     # Agregar nodos
     graph.add_node("master_planner", master_planner_node)
-    graph.add_node("chunk_persister", chunk_persister_node)
-    graph.add_node("dispatcher", dispatcher_node)
+    graph.add_node("context_indexer", context_indexer_node)
+    graph.add_node("dispatch_prepare", dispatch_prepare_node)
     graph.add_node("writer_agent", writer_agent_node)
     graph.add_node("collector", collector_node)
     graph.add_node("assembler", assembler_node)
@@ -404,15 +458,15 @@ def build_phase1_graph() -> StateGraph:
     
     # Flujo secuencial inicial
     graph.set_entry_point("master_planner")
-    graph.add_edge("master_planner", "chunk_persister")
-    graph.add_edge("chunk_persister", "dispatcher")
+    graph.add_edge("master_planner", "context_indexer")
+    graph.add_edge("context_indexer", "dispatch_prepare")
     
-    # Dispatcher genera Send() → writer_agent (paralelo)
-    # CORRECCIÓN: Usar 'generate_writer_tasks' como la función lógica del borde
+    # BIFURCACIÓN: dispatch_prepare -> Send() -> writer_agent (paralelo)
+    # Usamos add_conditional_edges con la función que retorna Send()
     graph.add_conditional_edges(
-        "dispatcher",
-        generate_writer_tasks,  # <--- USAR LA NUEVA FUNCIÓN AQUÍ
-        ["writer_agent"],       # Nodos destino posibles
+        "dispatch_prepare",
+        dispatch_to_writers,  # Función que retorna list[Send]
+        ["writer_agent"],  # Nodos destino posibles
     )
     
     # Writers convergen en collector
@@ -432,7 +486,7 @@ def build_phase1_graph() -> StateGraph:
 
 def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     """
-    Ejecuta el pipeline completo de Phase 1 V2.
+    Ejecuta el pipeline completo de Phase 1 V2.1 con RAG.
     
     Args:
         source_path: Ruta al archivo fuente
@@ -456,20 +510,17 @@ def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     }
     
     # Estado inicial
-    initial_state: Phase1State = {
+    initial_state = {
         "source_path": str(source_path),
         "raw_content": raw_content,
         "source_metadata": source_metadata,
         
-        # V2 fields
+        # V2.1 fields
         "master_plan": {},
-        "chunk_paths": [],
+        "db_path": "",
+        "index_stats": {},
+        "writer_tasks": [],
         "writer_results": [],
-        
-        # Legacy fields
-        "topics": [],
-        "ordered_outline": [],
-        "semantic_chunks": [],
         
         # Output
         "ordered_class_markdown": "",
@@ -487,8 +538,8 @@ def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     graph = build_phase1_graph()
     result = graph.invoke(initial_state)
     
-    # Limpiar chunks temporales (opcional)
-    # cleanup_temp_chunks(CHUNKS_DIR)
+    # Opcional: limpiar DB vectorial temporal
+    # cleanup_vector_db(source_metadata["source_id"], VECTOR_DB_DIR)
     
     return result
 
@@ -498,13 +549,13 @@ graph = build_phase1_graph()
 
 
 # =============================================================================
-# DIAGRAMA DEL GRAFO V2
+# DIAGRAMA DEL GRAFO V2.1
 # =============================================================================
 
 PHASE1_GRAPH_DIAGRAM = """
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PHASE 1 GRAPH V2                                    │
-│                  "Arquitectura Paralela con Send()"                         │
+│                         PHASE 1 GRAPH V2.1 (RAG)                            │
+│                     "Retrieval Augmented Generation"                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │    ┌──────────┐                                                             │
@@ -519,17 +570,18 @@ PHASE1_GRAPH_DIAGRAM = """
 │            │                                                                │
 │            ▼                                                                │
 │    ┌────────────────┐                                                       │
-│    │CHUNK_PERSISTER │  Guarda chunks en disco                               │
-│    │   (I/O only)   │  Output: chunk_paths[], libera RAM                    │
+│    │CONTEXT_INDEXER │  Crea índice vectorial (ChromaDB)                     │
+│    │   (Embeddings) │  Output: db_path para RAG queries                     │
 │    └───────┬────────┘                                                       │
 │            │                                                                │
 │            ▼                                                                │
 │    ┌────────────────┐                                                       │
-│    │   DISPATCHER   │  Crea tareas paralelas                                │
-│    │                │  Output: list[Send("writer_agent", task)]             │
+│    │DISPATCH_PREPARE│  Prepara tareas (NO bifurca)                          │
+│    │                │  Output: writer_tasks[]                               │
 │    └───────┬────────┘                                                       │
 │            │                                                                │
 │            │ ════════════════════════════════════                           │
+│            │   dispatch_to_writers (conditional)                            │
 │            │         Send() / MAP                                           │
 │            │ ════════════════════════════════════                           │
 │            │                                                                │
@@ -538,8 +590,9 @@ PHASE1_GRAPH_DIAGRAM = """
 │     ▼             ▼              ▼              ▼                           │
 │ ┌────────┐   ┌────────┐    ┌────────┐    ┌────────┐                         │
 │ │ WRITER │   │ WRITER │    │ WRITER │    │ WRITER │  ← Paralelo             │
-│ │ sec_01 │   │ sec_02 │    │ sec_03 │    │ sec_N  │  ← Contexto mínimo      │
-│ └───┬────┘   └───┬────┘    └───┬────┘    └───┬────┘  ← Solo SU chunk        │
+│ │ + RAG  │   │ + RAG  │    │ + RAG  │    │ + RAG  │  ← Cada uno BUSCA       │
+│ │ query  │   │ query  │    │ query  │    │ query  │  ← su contexto          │
+│ └───┬────┘   └───┬────┘    └───┬────┘    └───┬────┘                         │
 │     │            │             │             │                              │
 │     └────────────┴─────────────┴─────────────┘                              │
 │                          │                                                  │
@@ -572,9 +625,9 @@ PHASE1_GRAPH_DIAGRAM = """
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-BENEFICIOS:
-- Writers no comparten contexto → Sin contaminación cruzada
-- Chunks en disco → RAM liberada para cada writer
-- Paralelismo real → Tiempo total reducido
-- Fan-in ordenado → Documento coherente al final
+MEJORAS V2.1:
+- RAG: Writers buscan contexto relevante (Pull) vs recibir cortes (Push)
+- Independencia de formato: No depende de headers ni párrafos
+- Contexto completo: Puede recuperar info dispersa en el documento
+- Sin cortes arbitrarios: El indexador hace sliding windows matemático
 """

@@ -1,3 +1,0 @@
-## Evaluación de seguridad y robustez ante ataques (prompt injection y técnicas maliciosas)
-
-[Sin contenido]
