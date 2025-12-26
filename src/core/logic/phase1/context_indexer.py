@@ -13,12 +13,17 @@ MIGRACIÓN desde V2.1:
 - Reemplaza el chunking por ventana fija
 - Ahora preserva estructura jerárquica
 - Soporta búsqueda a nivel chunk Y bloque
+
+CORRECCIONES V3.1:
+- Manejo seguro de cleanup en Windows (PermissionError)
+- ChromaDB client se cierra antes de eliminar archivos
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -89,7 +94,7 @@ class ContextIndexer:
         # Componentes lazy-loaded
         self._chunker: Optional[HierarchicalChunker] = None
         self._embedder: Optional[MultiGranularEmbedder] = None
-        self._index: Optional[HierarchicalIndex] = None
+        self._index_cache: dict[str, HierarchicalIndex] = {}
         
         # Cache de documentos indexados
         self._indexed_docs: dict[str, HierarchicalDocument] = {}
@@ -113,10 +118,31 @@ class ContextIndexer:
     
     def get_index(self, source_id: str) -> HierarchicalIndex:
         """Obtiene o crea índice para una fuente."""
-        return HierarchicalIndex(
-            base_path=self.db_path,
-            source_id=source_id,
-        )
+        if source_id not in self._index_cache:
+            self._index_cache[source_id] = HierarchicalIndex(
+                base_path=self.db_path,
+                source_id=source_id,
+            )
+        return self._index_cache[source_id]
+    
+    def _close_index(self, source_id: str) -> None:
+        """
+        Cierra el cliente ChromaDB para una fuente.
+        Importante para liberar locks de archivos en Windows.
+        """
+        if source_id in self._index_cache:
+            index = self._index_cache[source_id]
+            # Forzar cierre del cliente ChromaDB
+            if index._client is not None:
+                try:
+                    # ChromaDB PersistentClient no tiene método close(),
+                    # pero podemos invalidar las referencias
+                    index._client = None
+                    index._chunks_collection = None
+                    index._blocks_collection = None
+                except Exception:
+                    pass
+            del self._index_cache[source_id]
     
     def index(
         self,
@@ -284,22 +310,65 @@ class ContextIndexer:
     
     def cleanup(self, source_id: Optional[str] = None) -> None:
         """
-        Limpia el índice.
+        Limpia el índice de forma segura.
         
         Args:
             source_id: Si se especifica, limpia solo esa fuente.
                        Si es None, limpia todo.
+                       
+        NOTA: En Windows, ChromaDB puede mantener archivos bloqueados.
+        Esta implementación intenta manejar esos casos gracefully.
         """
         if source_id:
-            index = self.get_index(source_id)
-            index.cleanup()
+            # Cerrar cliente antes de limpiar
+            self._close_index(source_id)
+            
+            index_path = self.db_path / source_id
+            if index_path.exists():
+                self._safe_rmtree(index_path)
+            
             if source_id in self._indexed_docs:
                 del self._indexed_docs[source_id]
         else:
+            # Cerrar todos los clientes
+            for sid in list(self._index_cache.keys()):
+                self._close_index(sid)
+            
             # Limpiar todo
             if self.db_path.exists():
-                shutil.rmtree(self.db_path)
+                self._safe_rmtree(self.db_path)
+            
             self._indexed_docs.clear()
+    
+    def _safe_rmtree(self, path: Path, max_retries: int = 3) -> bool:
+        """
+        Elimina un directorio de forma segura, manejando locks de Windows.
+        
+        Args:
+            path: Directorio a eliminar
+            max_retries: Número máximo de reintentos
+            
+        Returns:
+            True si se eliminó exitosamente
+        """
+        for attempt in range(max_retries):
+            try:
+                shutil.rmtree(path)
+                return True
+            except PermissionError as e:
+                if attempt < max_retries - 1:
+                    print(f"[ContextIndexer] Reintentando cleanup ({attempt + 1}/{max_retries})...")
+                    time.sleep(0.5 * (attempt + 1))  # Backoff exponencial
+                else:
+                    # En el último intento, loguear pero no fallar
+                    print(f"[ContextIndexer] ⚠️ No se pudo eliminar {path}: {e}")
+                    print("[ContextIndexer] Los archivos se sobrescribirán en la próxima indexación")
+                    return False
+            except Exception as e:
+                print(f"[ContextIndexer] Error inesperado en cleanup: {e}")
+                return False
+        
+        return False
 
 
 # =============================================================================

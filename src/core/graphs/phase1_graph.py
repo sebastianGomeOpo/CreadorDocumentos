@@ -147,26 +147,43 @@ def master_planner_node(state: Phase1GraphState) -> dict:
     raw_content = state.get("raw_content", "")
     source_path = state.get("source_path", "")
     
+    # FIX #1: Generar source_id desde el path para pasarlo a create_master_plan
+    source_id = generate_source_id(source_path)
+    
     print(f"\n{'='*60}")
     print("[MasterPlanner] Generando plan...")
     print(f"{'='*60}")
     
     try:
-        master_plan = create_master_plan(raw_content)
+        # FIX #1: Pasar source_id como segundo argumento requerido
+        master_plan = create_master_plan(raw_content, source_id)
         
-        topics = master_plan.get("topics", [])
-        print(f"[MasterPlanner] ✓ {len(topics)} temas identificados")
-        for i, topic in enumerate(topics):
-            print(f"  {i+1}. {topic.get('name', 'Sin nombre')}")
+        topics = master_plan.get("topics", []) if isinstance(master_plan, dict) else master_plan.topics
+        if isinstance(master_plan, dict):
+            topic_list = topics
+        else:
+            topic_list = master_plan.topics
+            master_plan = master_plan.model_dump()  # Convertir a dict para el estado
+        
+        print(f"[MasterPlanner] ✓ {len(topic_list)} temas identificados")
+        for i, topic in enumerate(topic_list):
+            if isinstance(topic, dict):
+                print(f"  {i+1}. {topic.get('topic_name', topic.get('name', 'Sin nombre'))}")
+            else:
+                print(f"  {i+1}. {topic.topic_name}")
         
         return {
             "master_plan": master_plan,
+            "source_id": source_id,  # Propagar source_id al estado
             "current_node": "master_planner",
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "error": f"Error en MasterPlanner: {str(e)}",
+            "source_id": source_id,
             "current_node": "master_planner",
         }
 
@@ -178,20 +195,29 @@ def context_indexer_node(state: Phase1GraphState) -> dict:
     raw_content = state.get("raw_content", "")
     source_path = state.get("source_path", "unknown")
     
+    # Usar source_id del estado si ya existe, sino generarlo
+    source_id = state.get("source_id") or generate_source_id(source_path)
+    
     print(f"\n{'='*60}")
     print("[ContextIndexer] Indexando contenido...")
     print(f"{'='*60}")
     
-    # Generar source_id
-    source_id = generate_source_id(source_path)
     db_path = str(VECTOR_DB_DIR)
     
     try:
-        # Crear indexer y procesar
+        # Crear indexer
         indexer = ContextIndexer(db_path)
         
-        # Limpiar índice anterior si existe
-        indexer.cleanup(source_id)
+        # FIX #2: Limpiar índice anterior de forma segura (sin shutil.rmtree mientras ChromaDB tiene archivos abiertos)
+        # En lugar de cleanup(), que puede fallar en Windows, simplemente indexamos
+        # El índice se sobrescribirá si ya existe
+        try:
+            indexer.cleanup(source_id)
+        except PermissionError as pe:
+            print(f"[ContextIndexer] ⚠️ No se pudo limpiar índice anterior (archivo en uso): {pe}")
+            print("[ContextIndexer] Continuando con re-indexación...")
+        except Exception as ce:
+            print(f"[ContextIndexer] ⚠️ Advertencia en cleanup: {ce}")
         
         # Indexar documento
         stats = indexer.index(source_id, raw_content)
@@ -208,6 +234,8 @@ def context_indexer_node(state: Phase1GraphState) -> dict:
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "error": f"Error en indexación: {str(e)}",
             "source_id": source_id,
@@ -225,6 +253,7 @@ def dispatch_prepare_node(state: Phase1GraphState) -> dict:
     source_id = state.get("source_id", "")
     db_path = state.get("db_path", "")
     
+    # Extraer topics del master_plan
     topics = master_plan.get("topics", [])
     total_topics = len(topics)
     
@@ -232,20 +261,29 @@ def dispatch_prepare_node(state: Phase1GraphState) -> dict:
     print(f"[Dispatch] Preparando {total_topics} tareas...")
     print(f"{'='*60}")
     
+    if total_topics == 0:
+        print("[Dispatch] ⚠️ No hay temas en el MasterPlan")
+        return {
+            "writer_tasks": [],
+            "current_node": "dispatch_prepare",
+        }
+    
     writer_tasks = []
     
     for i, topic in enumerate(topics):
         # Construir contexto de navegación
         navigation = {}
         if i > 0:
-            navigation["previous_topic"] = topics[i - 1].get("name", "")
+            prev_topic = topics[i - 1]
+            navigation["previous_topic"] = prev_topic.get("topic_name", prev_topic.get("name", ""))
         if i < total_topics - 1:
-            navigation["next_topic"] = topics[i + 1].get("name", "")
+            next_topic = topics[i + 1]
+            navigation["next_topic"] = next_topic.get("topic_name", next_topic.get("name", ""))
         
         task = {
             "source_id": source_id,
             "db_path": db_path,
-            "topic_name": topic.get("name", f"Tema {i+1}"),
+            "topic_name": topic.get("topic_name", topic.get("name", f"Tema {i+1}")),
             "topic_index": i,
             "total_topics": total_topics,
             "key_concepts": topic.get("key_concepts", []),
@@ -271,6 +309,10 @@ def dispatch_to_writers(state: Phase1GraphState) -> list:
         Lista de Send() para ejecución paralela
     """
     writer_tasks = state.get("writer_tasks", [])
+    
+    # Si hay error previo o no hay tareas, ir directo a collector
+    if state.get("error") or not writer_tasks:
+        return [Send("collector", {})]
     
     sends = []
     for task in writer_tasks:
@@ -325,6 +367,13 @@ def collector_node(state: Phase1GraphState) -> dict:
     print(f"[Collector] Recolectando {len(writer_results)} resultados...")
     print(f"{'='*60}")
     
+    # Si hay error previo, propagar
+    if state.get("error"):
+        return {
+            "writer_results": writer_results,
+            "current_node": "collector",
+        }
+    
     # Ordenar por topic_index
     sorted_results = sorted(
         writer_results,
@@ -351,13 +400,25 @@ def assembler_node(state: Phase1GraphState) -> dict:
     writer_results = state.get("writer_results", [])
     master_plan = state.get("master_plan", {})
     source_path = state.get("source_path", "")
+    source_id = state.get("source_id", "")
     
     print(f"\n{'='*60}")
     print("[Assembler] Ensamblando documento final...")
     print(f"{'='*60}")
     
+    # Si hay error previo o no hay resultados, crear bundle mínimo
+    if state.get("error") or not writer_results:
+        print("[Assembler] ⚠️ Sin resultados para ensamblar")
+        return {
+            "ordered_class_markdown": "",
+            "draft_path": "",
+            "section_notes_dir": "",
+            "warnings": [state.get("error", "Sin resultados")],
+            "current_node": "assembler",
+        }
+    
     try:
-        result = run_assembler(writer_results, master_plan, source_path)
+        result = run_assembler(writer_results, source_id, master_plan)
         
         print(f"[Assembler] ✓ Documento ensamblado")
         print(f"[Assembler] ✓ Draft: {result.get('draft_path', 'N/A')}")
@@ -365,12 +426,14 @@ def assembler_node(state: Phase1GraphState) -> dict:
         return {
             "ordered_class_markdown": result.get("markdown", ""),
             "draft_path": result.get("draft_path", ""),
-            "section_notes_dir": result.get("notes_dir", ""),
+            "section_notes_dir": result.get("section_notes_dir", ""),
             "warnings": result.get("warnings", []),
             "current_node": "assembler",
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "error": f"Error en ensamblaje: {str(e)}",
             "current_node": "assembler",
@@ -386,18 +449,28 @@ def bundle_creator_node(state: Phase1GraphState) -> dict:
     print(f"{'='*60}")
     
     source_path = state.get("source_path", "")
-    bundle_id = generate_bundle_id(source_path)
+    source_id = state.get("source_id", "") or generate_source_id(source_path)
+    bundle_id = generate_bundle_id(source_id)
+    
+    # Verificar si hubo error
+    error = state.get("error")
+    if error:
+        print(f"[BundleCreator] ⚠️ Bundle con error: {error}")
     
     bundle = {
         "bundle_id": bundle_id,
         "source_path": source_path,
-        "draft_path": state.get("draft_path", ""),
-        "notes_dir": state.get("section_notes_dir", ""),
+        "source_metadata": state.get("source_metadata", {}),
+        "raw_content_preview": state.get("raw_content", "")[:500],
         "master_plan": state.get("master_plan", {}),
+        "draft_path": state.get("draft_path", ""),
+        "section_notes_dir": state.get("section_notes_dir", ""),
+        "ordered_class_markdown": state.get("ordered_class_markdown", ""),
         "index_stats": state.get("index_stats", {}),
         "warnings": state.get("warnings", []),
         "created_at": datetime.now().isoformat(),
-        "status": "pending_review",
+        "status": "error" if error else "pending_review",
+        "error": error,
     }
     
     print(f"[BundleCreator] ✓ Bundle ID: {bundle_id}")
@@ -436,7 +509,7 @@ def build_phase1_graph() -> StateGraph:
     graph.add_conditional_edges(
         "dispatch_prepare",
         dispatch_to_writers,
-        ["writer_agent"],
+        ["writer_agent", "collector"],  # Posibles destinos
     )
     
     # Fan-in
@@ -514,12 +587,12 @@ graph = build_phase1_graph()
 
 
 # =============================================================================
-# DIAGRAMA DEL GRAFO V2.1
+# DIAGRAMA DEL GRAFO V3
 # =============================================================================
 
 PHASE1_GRAPH_DIAGRAM = """
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PHASE 1 GRAPH V2.1 (RAG)                            │
+│                         PHASE 1 GRAPH V3 (RAG)                              │
 │                     "Retrieval Augmented Generation"                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
@@ -590,9 +663,8 @@ PHASE1_GRAPH_DIAGRAM = """
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-MEJORAS V2.1:
-- RAG: Writers buscan contexto relevante (Pull) vs recibir cortes (Push)
-- Independencia de formato: No depende de headers ni párrafos
-- Contexto completo: Puede recuperar info dispersa en el documento
-- Sin cortes arbitrarios: El indexador hace sliding windows matemático
+CORRECCIONES V3.1:
+- FIX #1: master_planner_node ahora pasa source_id a create_master_plan()
+- FIX #2: context_indexer_node maneja PermissionError en cleanup (Windows)
+- dispatch_to_writers ahora maneja caso sin tareas correctamente
 """
