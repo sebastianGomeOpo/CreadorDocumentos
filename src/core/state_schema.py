@@ -533,10 +533,15 @@ def generate_source_id(content: str) -> str:
     return f"src_{content_hash[:16]}"
 
 
-def generate_bundle_id(source_id: str, phase: int) -> str:
+def generate_bundle_id(source_id: str, phase: int = 1) -> str:
     """Genera ID único para un bundle."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"bundle_p{phase}_{source_id}_{timestamp}"
+    # Si source_id ya tiene el prefijo src_, extraer solo el hash
+    if source_id.startswith("src_"):
+        short_id = source_id[4:12]  # Primeros 8 chars del hash
+    else:
+        short_id = source_id[:8]
+    return f"bundle_p{phase}_{short_id}_{timestamp}"
 
 
 def generate_plan_id(source_id: str) -> str:
@@ -557,3 +562,144 @@ def generate_chunk_id(content: str, topic_id: str) -> str:
     combined = f"{topic_id}:{content[:100]}"
     chunk_hash = hashlib.sha256(combined.encode()).hexdigest()[:10]
     return f"chunk_{chunk_hash}"
+
+
+# =============================================================================
+# V3: TIPOS PARA RAG AVANZADO
+# =============================================================================
+
+class FacetType(str, Enum):
+    """Tipos de facetas de búsqueda."""
+    TOPIC = "topic"
+    MUST_INCLUDE = "must_include"
+    KEY_CONCEPT = "key_concept"
+    NAVIGATION = "navigation"
+    EXPANSION = "expansion"
+
+
+class CoverageStatus(str, Enum):
+    """Estado de cobertura de una faceta."""
+    STRONG = "strong"
+    PARTIAL = "partial"
+    WEAK = "weak"
+    MISSING = "missing"
+
+
+class BlockType(str, Enum):
+    """Tipos de bloques detectados en el documento."""
+    HEADING_SECTION = "heading_section"
+    PARAGRAPH_GROUP = "paragraph_group"
+    LIST_BLOCK = "list_block"
+    CODE_BLOCK = "code_block"
+    DIALOGUE_BLOCK = "dialogue_block"
+    GENERIC = "generic"
+
+
+class FacetSchema(BaseModel):
+    """Schema para una faceta de búsqueda."""
+    facet_id: str
+    name: str
+    facet_type: FacetType
+    intent: str
+    query_text: str
+    weight: float = 1.0
+    required: bool = False
+
+
+class QueryPlanSchema(BaseModel):
+    """Schema para un plan de queries."""
+    topic_name: str
+    facets: list[FacetSchema] = Field(default_factory=list)
+    estimated_complexity: Literal["low", "medium", "high"] = "medium"
+    
+    @computed_field
+    @property
+    def required_facets(self) -> list[FacetSchema]:
+        return [f for f in self.facets if f.required]
+    
+    @computed_field
+    @property
+    def facet_count(self) -> int:
+        return len(self.facets)
+
+
+class ChunkMetadata(BaseModel):
+    """Metadata de un chunk indexado."""
+    chunk_id: str
+    block_id: str
+    position_in_block: int
+    total_in_block: int
+    prev_chunk_id: str | None = None
+    next_chunk_id: str | None = None
+    source_id: str
+
+
+class BlockMetadata(BaseModel):
+    """Metadata de un bloque indexado."""
+    block_id: str
+    heading: str | None = None
+    block_type: BlockType
+    position_in_doc: int
+    chunk_count: int
+
+
+class RetrievalMetrics(BaseModel):
+    """Métricas de una operación de retrieval."""
+    candidates_retrieved: int
+    candidates_scored: int
+    chunks_selected: int
+    required_coverage_pct: float
+    optional_coverage_pct: float
+    diversity_score: float
+    coherence_score: float
+    channels_used: list[str] = Field(default_factory=list)
+
+
+class EvidencePackSchema(BaseModel):
+    """Schema para un Evidence Pack."""
+    topic_name: str
+    total_chunks: int
+    total_tokens_estimate: int
+    has_full_coverage: bool
+    facets_covered: list[str] = Field(default_factory=list)
+    facets_missing: list[str] = Field(default_factory=list)
+
+
+class WriterResultV3(BaseModel):
+    """Resultado extendido del Writer V3."""
+    topic_name: str
+    topic_index: int
+    markdown: str
+    word_count: int
+    
+    # Directivas
+    must_include_followed: list[str] = Field(default_factory=list)
+    must_include_missing: list[str] = Field(default_factory=list)
+    must_exclude_violated: list[str] = Field(default_factory=list)
+    
+    # Cobertura RAG
+    coverage_complete: bool = False
+    coverage_pct: float = 0.0
+    facets_covered: list[str] = Field(default_factory=list)
+    facets_missing: list[str] = Field(default_factory=list)
+    
+    # Métricas
+    chunks_used: int = 0
+    retrieval_metrics: RetrievalMetrics | None = None
+    
+    # Timestamps y warnings
+    warnings: list[str] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=datetime.now)
+    completed_at: datetime = Field(default_factory=datetime.now)
+
+
+class IndexStats(BaseModel):
+    """Estadísticas de indexación."""
+    source_id: str
+    blocks_count: int
+    chunks_count: int
+    chunks_indexed: int
+    blocks_indexed: int
+    embedding_model: str
+    elapsed_seconds: float
+    db_path: str

@@ -1,29 +1,23 @@
 """
-phase1_graph.py — Grafo LangGraph V2.1 con RAG
+phase1_graph.py — Grafo LangGraph V3 (RAG Avanzado)
 
-Este grafo transforma una transcripción/texto crudo en una
-"clase ordenada" lista para revisión humana.
+Transforma una transcripción/texto crudo en una "clase ordenada"
+lista para revisión humana usando RAG jerárquico avanzado.
 
-ARQUITECTURA V2.1 (RAG):
-- Planificación secuencial (MasterPlan)
-- INDEXACIÓN VECTORIAL (reemplaza chunk_persister)
-- Redacción paralela con RETRIEVAL (Pull vs Push)
-- Ensamblaje (Fan-in)
+ARQUITECTURA V3:
+1. MasterPlan: Planificación de estructura
+2. Indexación Jerárquica: Bloques + Chunks + Embeddings multi-nivel
+3. Redacción Paralela: TopicRetriever + Evidence Pack por sección
+4. Ensamblaje: Fan-in de resultados
 
-CAMBIOS VS V2.0:
-- context_indexer reemplaza a chunk_persister
-- Writers buscan contexto via RAG en lugar de leer archivos
-- Corregido InvalidUpdateError: dispatcher separado de bifurcación
-- Corregido concurrencia: Phase1StateV2 con reducer apropiado
-
-NODOS:
-1. master_planner     → Genera MasterPlan con directivas
-2. context_indexer    → Crea índice vectorial (ChromaDB)
-3. dispatch_prepare   → Prepara tareas (no bifurca)
-4. writer_agent       → [PARALELO] Redacta con RAG
-5. collector          → [FAN-IN] Recolecta resultados
-6. assembler          → Ensambla documento final
-7. bundle_creator     → Serializa para revisión
+CAMBIOS VS V2.1:
+- Indexador usa hierarchical_chunker (semántico, no ventana fija)
+- Writers usan TopicRetriever con pipeline completo:
+  - Facet Query Planner
+  - Multi-Channel Retriever (Dense + Sparse + Parent)
+  - Fusion Scorer (Relevancia + Coherencia - Redundancia)
+  - Coverage Selector (no Top-K)
+  - Context Assembler (Evidence Pack)
 
 FLUJO:
     START → master_planner → context_indexer → dispatch_prepare
@@ -35,30 +29,20 @@ FLUJO:
                                     ┌──────────────────┼──────────────────┐
                                     ▼                  ▼                  ▼
                               writer_agent       writer_agent       writer_agent
-                                (RAG query)       (RAG query)       (RAG query)
+                              (Evidence Pack)   (Evidence Pack)   (Evidence Pack)
                                     │                  │                  │
                                     └──────────────────┼──────────────────┘
                                                        │
-                                              ┌────────┴────────┐
-                                              │    collector    │
-                                              │    (Fan-in)     │
-                                              └─────────────────┘
-                                                       │
-                                                       ▼
-                                                  assembler
-                                                       │
-                                                       ▼
-                                               bundle_creator → END
+                                                  collector → assembler → bundle_creator → END
 """
 
 from __future__ import annotations
 
 import hashlib
-import operator
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, Sequence
+from typing import Annotated, Any, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
@@ -74,7 +58,7 @@ from core.state_schema import (
 )
 
 from core.logic.phase1.master_planner import create_master_plan
-from core.logic.phase1.context_indexer import index_content_for_rag, cleanup_vector_db
+from core.logic.phase1.context_indexer import ContextIndexer, cleanup_vector_db
 from core.logic.phase1.writer_agent import run_writer_agent
 from core.logic.phase1.assembler import run_assembler
 
@@ -86,19 +70,19 @@ load_dotenv()
 # =============================================================================
 
 DATA_BASE_PATH = Path(os.getenv("DATA_PATH", "./data"))
-VECTOR_DB_DIR = DATA_BASE_PATH / "temp" / "vector_db"
+VECTOR_DB_DIR = DATA_BASE_PATH / "temp" / "hierarchical_index"
 DRAFTS_DIR = DATA_BASE_PATH / "drafts"
 NOTES_DIR = DATA_BASE_PATH / "section_notes"
 
 
 # =============================================================================
-# ESTADO V2.1 CON REDUCER PARA FAN-IN
+# ESTADO V3 CON REDUCER PARA FAN-IN
 # =============================================================================
 
 def add_writer_results(
-    existing: list[dict] | None,
-    new: list[dict] | dict | None,
-) -> list[dict]:
+    existing: list | None,
+    new: list | dict | None,
+) -> list:
     """
     Reducer que acumula resultados de writers.
     Permite que múltiples nodos paralelos agreguen sus resultados.
@@ -117,335 +101,322 @@ def add_writer_results(
     return existing
 
 
-class Phase1StateV2(Phase1State):
-    """
-    Estado extendido con:
-    - Reducer para writer_results (fan-in)
-    - Campos para RAG (db_path, source_id accesible)
-    """
-    # El Annotated con reducer permite acumulación desde nodos paralelos
-    writer_results: Annotated[list[dict], add_writer_results]
+class Phase1GraphState(TypedDict, total=False):
+    """Estado del grafo Phase1 V3"""
+    # Input
+    source_path: str
+    raw_content: str
+    source_metadata: dict
     
-    # V2.1: Campos adicionales para RAG
-    db_path: str  # Ruta a la base vectorial
-    index_stats: dict  # Estadísticas del indexador
+    # MasterPlan
+    master_plan: dict
+    
+    # Indexación
+    source_id: str
+    db_path: str
+    index_stats: dict
+    
+    # Dispatch
+    writer_tasks: list
+    
+    # Results (con reducer para fan-in)
+    writer_results: Annotated[list, add_writer_results]
+    
+    # Assembly
+    ordered_class_markdown: str
+    draft_path: str
+    section_notes_dir: str
+    
+    # Output
+    warnings: list
+    bundle: dict
+    
+    # Control
+    current_node: str
+    error: str
 
 
 # =============================================================================
-# NODO 1: MASTER PLANNER
+# NODOS DEL GRAFO
 # =============================================================================
 
-def master_planner_node(state: dict) -> dict[str, Any]:
+def master_planner_node(state: Phase1GraphState) -> dict:
     """
-    Nodo 1: Genera el MasterPlan.
-    
-    Input: raw_content, source_metadata
-    Output: master_plan (serializado)
+    Genera el MasterPlan desde el contenido raw.
     """
-    raw_content = state["raw_content"]
-    source_meta = state.get("source_metadata", {})
-    source_id = source_meta.get("source_id", generate_source_id(raw_content))
+    raw_content = state.get("raw_content", "")
+    source_path = state.get("source_path", "")
     
-    plan = create_master_plan(raw_content, source_id)
+    print(f"\n{'='*60}")
+    print("[MasterPlanner] Generando plan...")
+    print(f"{'='*60}")
     
-    return {
-        "master_plan": plan.model_dump(),
-        "current_node": "master_planner",
-    }
-
-
-# =============================================================================
-# NODO 2: CONTEXT INDEXER (reemplaza chunk_persister)
-# =============================================================================
-
-def context_indexer_node(state: dict) -> dict[str, Any]:
-    """
-    Nodo 2: Crea índice vectorial del contenido.
-    
-    REEMPLAZA a chunk_persister.
-    En lugar de cortar archivos, crea una DB vectorial para búsqueda semántica.
-    
-    Input: raw_content, source_metadata
-    Output: db_path, index_stats
-    """
-    raw_content = state["raw_content"]
-    source_meta = state.get("source_metadata", {})
-    source_id = source_meta.get("source_id", generate_source_id(raw_content))
-    
-    # Crear índice vectorial
-    stats = index_content_for_rag(
-        raw_content=raw_content,
-        source_id=source_id,
-        base_path=VECTOR_DB_DIR,
-    )
-    
-    return {
-        "db_path": stats["db_path"],
-        "index_stats": stats,
-        "current_node": "context_indexer",
-    }
-
-
-# =============================================================================
-# NODO 3: DISPATCH PREPARE (prepara tareas, NO bifurca)
-# =============================================================================
-
-def dispatch_prepare_node(state: dict) -> dict[str, Any]:
-    """
-    Nodo 3: Prepara las tareas para los writers.
-    
-    IMPORTANTE: Este nodo NO bifurca. Solo prepara los datos.
-    La bifurcación ocurre en dispatch_to_writers (conditional edge).
-    
-    Esto evita el error InvalidUpdateError.
-    """
-    plan_dict = state.get("master_plan", {})
-    source_meta = state.get("source_metadata", {})
-    source_id = source_meta.get("source_id", "")
-    db_path = state.get("db_path", str(VECTOR_DB_DIR))
-    
-    # Preparar lista de tareas (se usará en dispatch_to_writers)
-    tasks = []
-    
-    if plan_dict:
-        plan = MasterPlan(**plan_dict)
+    try:
+        master_plan = create_master_plan(raw_content)
         
-        for topic in plan.topics:
-            task = {
-                "sequence_id": topic.sequence_id,
-                "topic_id": topic.topic_id,
-                "topic_name": topic.topic_name,
-                "must_include": topic.must_include,
-                "must_exclude": topic.must_exclude,
-                "key_concepts": topic.key_concepts,
-                "navigation_context": topic.navigation.model_dump() if topic.navigation else {},
-                # V2.1: Campos para RAG
-                "source_id": source_id,
-                "db_path": db_path,
-            }
-            tasks.append(task)
+        topics = master_plan.get("topics", [])
+        print(f"[MasterPlanner] ✓ {len(topics)} temas identificados")
+        for i, topic in enumerate(topics):
+            print(f"  {i+1}. {topic.get('name', 'Sin nombre')}")
+        
+        return {
+            "master_plan": master_plan,
+            "current_node": "master_planner",
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Error en MasterPlanner: {str(e)}",
+            "current_node": "master_planner",
+        }
+
+
+def context_indexer_node(state: Phase1GraphState) -> dict:
+    """
+    Indexa el contenido usando el pipeline jerárquico.
+    """
+    raw_content = state.get("raw_content", "")
+    source_path = state.get("source_path", "unknown")
+    
+    print(f"\n{'='*60}")
+    print("[ContextIndexer] Indexando contenido...")
+    print(f"{'='*60}")
+    
+    # Generar source_id
+    source_id = generate_source_id(source_path)
+    db_path = str(VECTOR_DB_DIR)
+    
+    try:
+        # Crear indexer y procesar
+        indexer = ContextIndexer(db_path)
+        
+        # Limpiar índice anterior si existe
+        indexer.cleanup(source_id)
+        
+        # Indexar documento
+        stats = indexer.index(source_id, raw_content)
+        
+        print(f"[ContextIndexer] ✓ {stats['chunks_count']} chunks indexados")
+        print(f"[ContextIndexer] ✓ {stats['blocks_count']} bloques detectados")
+        print(f"[ContextIndexer] ✓ Tiempo: {stats['elapsed_seconds']:.2f}s")
+        
+        return {
+            "source_id": source_id,
+            "db_path": db_path,
+            "index_stats": stats,
+            "current_node": "context_indexer",
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Error en indexación: {str(e)}",
+            "source_id": source_id,
+            "db_path": db_path,
+            "current_node": "context_indexer",
+        }
+
+
+def dispatch_prepare_node(state: Phase1GraphState) -> dict:
+    """
+    Prepara las tareas para los writers.
+    NO bifurca - eso lo hace dispatch_to_writers.
+    """
+    master_plan = state.get("master_plan", {})
+    source_id = state.get("source_id", "")
+    db_path = state.get("db_path", "")
+    
+    topics = master_plan.get("topics", [])
+    total_topics = len(topics)
+    
+    print(f"\n{'='*60}")
+    print(f"[Dispatch] Preparando {total_topics} tareas...")
+    print(f"{'='*60}")
+    
+    writer_tasks = []
+    
+    for i, topic in enumerate(topics):
+        # Construir contexto de navegación
+        navigation = {}
+        if i > 0:
+            navigation["previous_topic"] = topics[i - 1].get("name", "")
+        if i < total_topics - 1:
+            navigation["next_topic"] = topics[i + 1].get("name", "")
+        
+        task = {
+            "source_id": source_id,
+            "db_path": db_path,
+            "topic_name": topic.get("name", f"Tema {i+1}"),
+            "topic_index": i,
+            "total_topics": total_topics,
+            "key_concepts": topic.get("key_concepts", []),
+            "must_include": topic.get("must_include", []),
+            "must_exclude": topic.get("must_exclude", []),
+            "navigation": navigation,
+        }
+        
+        writer_tasks.append(task)
+        print(f"  [Task {i+1}] {task['topic_name']}")
     
     return {
-        "writer_tasks": tasks,  # Se usa en dispatch_to_writers
+        "writer_tasks": writer_tasks,
         "current_node": "dispatch_prepare",
     }
 
 
-# =============================================================================
-# FUNCIÓN DE BIFURCACIÓN (conditional edge, NO es nodo)
-# =============================================================================
-
-def dispatch_to_writers(state: dict) -> list[Send]:
+def dispatch_to_writers(state: Phase1GraphState) -> list:
     """
-    Función de bifurcación que genera Send() para cada tarea.
+    Función de conditional_edges que dispara Send() a cada writer.
     
-    Esta función se usa como conditional_edge, NO como nodo.
-    Retorna lista de Send() que disparan writer_agent en paralelo.
+    Returns:
+        Lista de Send() para ejecución paralela
     """
-    tasks = state.get("writer_tasks", [])
+    writer_tasks = state.get("writer_tasks", [])
     
     sends = []
-    for task in tasks:
-        # Construir WriterTaskState
-        task_state: WriterTaskState = {
-            "chunk_path": "",  # No usado en V2.1
-            "sequence_id": task["sequence_id"],
-            "topic_id": task["topic_id"],
-            "topic_name": task["topic_name"],
-            "must_include": task.get("must_include", []),
-            "must_exclude": task.get("must_exclude", []),
-            "key_concepts": task.get("key_concepts", []),
-            "navigation_context": task.get("navigation_context", {}),
-            # V2.1: RAG fields
-            "source_id": task.get("source_id", ""),
-            "db_path": task.get("db_path", ""),
-        }
-        
-        sends.append(Send("writer_agent", task_state))
+    for task in writer_tasks:
+        sends.append(Send("writer_agent", task))
     
     return sends
 
 
-# =============================================================================
-# NODO 4: WRITER AGENT (ejecuta en paralelo con RAG)
-# =============================================================================
-
-def writer_agent_node(state: WriterTaskState) -> dict[str, Any]:
+def writer_agent_node(task_state: dict) -> dict:
     """
-    Nodo 4: Writer Agent - redacta una sección usando RAG.
-    
-    V2.1: Ahora BUSCA contexto en la base vectorial en lugar de leer archivo.
-    Se ejecuta N veces en paralelo, una por cada Send().
+    Ejecuta el Writer Agent para una tarea.
+    Recibe task_state directamente del Send().
     """
-    result = run_writer_agent(state)
+    topic_name = task_state.get("topic_name", "Unknown")
+    topic_index = task_state.get("topic_index", 0)
     
-    # Retornar resultado para acumular en writer_results
-    return {
-        "writer_results": [result.model_dump()],
-    }
+    print(f"\n  [Writer {topic_index + 1}] Redactando: {topic_name}")
+    
+    try:
+        result = run_writer_agent(task_state)
+        
+        print(f"  [Writer {topic_index + 1}] ✓ {result['word_count']} palabras")
+        if result.get("warnings"):
+            for w in result["warnings"]:
+                print(f"  [Writer {topic_index + 1}] ⚠ {w}")
+        
+        # Retornar para el reducer
+        return {"writer_results": result}
+        
+    except Exception as e:
+        print(f"  [Writer {topic_index + 1}] ✗ Error: {str(e)}")
+        return {
+            "writer_results": {
+                "topic_name": topic_name,
+                "topic_index": topic_index,
+                "markdown": f"# {topic_name}\n\n[Error: {str(e)}]",
+                "word_count": 0,
+                "warnings": [f"Error: {str(e)}"],
+                "error": str(e),
+            }
+        }
 
 
-# =============================================================================
-# NODO 5: COLLECTOR (fan-in)
-# =============================================================================
-
-def collector_node(state: dict) -> dict[str, Any]:
+def collector_node(state: Phase1GraphState) -> dict:
     """
-    Nodo 5: Collector - punto de sincronización.
-    
-    Los resultados ya están acumulados en writer_results por el reducer.
-    Este nodo marca el fin del paralelismo.
+    Recolecta y ordena resultados de writers.
+    El reducer ya acumuló todo en writer_results.
     """
     writer_results = state.get("writer_results", [])
     
-    return {
-        "current_node": "collector",
-        # writer_results ya acumulados
-    }
-
-
-# =============================================================================
-# NODO 6: ASSEMBLER
-# =============================================================================
-
-def assembler_node(state: dict) -> dict[str, Any]:
-    """
-    Nodo 6: Assembler - ensambla documento final.
-    """
-    writer_results = state.get("writer_results", [])
-    plan_dict = state.get("master_plan", {})
-    source_meta = state.get("source_metadata", {})
-    source_id = source_meta.get("source_id", "unknown")
+    print(f"\n{'='*60}")
+    print(f"[Collector] Recolectando {len(writer_results)} resultados...")
+    print(f"{'='*60}")
     
-    result = run_assembler(
-        writer_results=writer_results,
-        source_id=source_id,
-        master_plan=plan_dict,
-        drafts_dir=DRAFTS_DIR,
-        notes_dir=NOTES_DIR,
+    # Ordenar por topic_index
+    sorted_results = sorted(
+        writer_results,
+        key=lambda r: r.get("topic_index", 0)
     )
     
-    # Leer draft para ordered_class_markdown
-    draft_path = result["draft_path"]
+    # Estadísticas
+    total_words = sum(r.get("word_count", 0) for r in sorted_results)
+    with_warnings = sum(1 for r in sorted_results if r.get("warnings"))
+    
+    print(f"[Collector] ✓ {total_words} palabras totales")
+    print(f"[Collector] ✓ {with_warnings} secciones con warnings")
+    
+    return {
+        "writer_results": sorted_results,
+        "current_node": "collector",
+    }
+
+
+def assembler_node(state: Phase1GraphState) -> dict:
+    """
+    Ensambla el documento final desde los resultados.
+    """
+    writer_results = state.get("writer_results", [])
+    master_plan = state.get("master_plan", {})
+    source_path = state.get("source_path", "")
+    
+    print(f"\n{'='*60}")
+    print("[Assembler] Ensamblando documento final...")
+    print(f"{'='*60}")
+    
     try:
-        with open(draft_path, "r", encoding="utf-8") as f:
-            ordered_class_markdown = f.read()
-    except Exception:
-        ordered_class_markdown = ""
-    
-    warnings = [
-        {"type": "processing", "description": w, "severity": "medium"}
-        for w in result.get("warnings", [])
-    ]
-    
-    return {
-        "draft_path": result["draft_path"],
-        "section_notes_dir": result["section_notes_dir"],
-        "ordered_class_markdown": ordered_class_markdown,
-        "warnings": warnings,
-        "current_node": "assembler",
-    }
+        result = run_assembler(writer_results, master_plan, source_path)
+        
+        print(f"[Assembler] ✓ Documento ensamblado")
+        print(f"[Assembler] ✓ Draft: {result.get('draft_path', 'N/A')}")
+        
+        return {
+            "ordered_class_markdown": result.get("markdown", ""),
+            "draft_path": result.get("draft_path", ""),
+            "section_notes_dir": result.get("notes_dir", ""),
+            "warnings": result.get("warnings", []),
+            "current_node": "assembler",
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Error en ensamblaje: {str(e)}",
+            "current_node": "assembler",
+        }
 
 
-# =============================================================================
-# NODO 7: BUNDLE CREATOR
-# =============================================================================
-
-def bundle_creator_node(state: dict) -> dict[str, Any]:
+def bundle_creator_node(state: Phase1GraphState) -> dict:
     """
-    Nodo 7: Crea el bundle para revisión humana.
+    Crea el bundle final para revisión.
     """
-    source_meta = state.get("source_metadata", {})
-    source_id = source_meta.get("source_id", generate_source_id(state.get("raw_content", "")))
-    bundle_id = generate_bundle_id(source_id, phase=1)
+    print(f"\n{'='*60}")
+    print("[BundleCreator] Creando bundle...")
+    print(f"{'='*60}")
     
-    plan_dict = state.get("master_plan", {})
+    source_path = state.get("source_path", "")
+    bundle_id = generate_bundle_id(source_path)
     
-    # Extraer topics para formato legacy
-    topics = []
-    ordered_outline = []
-    
-    if plan_dict:
-        plan = MasterPlan(**plan_dict)
-        for topic in plan.topics:
-            topics.append({
-                "id": topic.topic_id,
-                "name": topic.topic_name,
-                "description": topic.description,
-                "relevance": 80,
-                "type": "concept",
-            })
-            ordered_outline.append({
-                "position": topic.sequence_id,
-                "topic_id": topic.topic_id,
-                "topic_name": topic.topic_name,
-                "rationale": f"Directivas: include={topic.must_include}, exclude={topic.must_exclude}",
-                "subtopics": topic.key_concepts,
-            })
-    
-    bundle_dict = {
+    bundle = {
         "bundle_id": bundle_id,
-        "source_metadata": source_meta,
-        "raw_content_preview": state.get("raw_content", "")[:500],
-        
-        # V2.1: Plan maestro + RAG stats
-        "master_plan": plan_dict,
-        "index_stats": state.get("index_stats", {}),
-        
-        # Legacy compatibility
-        "topics": topics,
-        "ordered_outline": ordered_outline,
-        "semantic_chunks": [],
-        
-        # Productos
-        "ordered_class_markdown": state.get("ordered_class_markdown", ""),
+        "source_path": source_path,
         "draft_path": state.get("draft_path", ""),
-        "section_notes_dir": state.get("section_notes_dir", ""),
-        "chunk_files": [],  # No usado en V2.1
-        
-        # Warnings
+        "notes_dir": state.get("section_notes_dir", ""),
+        "master_plan": state.get("master_plan", {}),
+        "index_stats": state.get("index_stats", {}),
         "warnings": state.get("warnings", []),
+        "created_at": datetime.now().isoformat(),
+        "status": "pending_review",
     }
     
+    print(f"[BundleCreator] ✓ Bundle ID: {bundle_id}")
+    
     return {
-        "bundle": bundle_dict,
+        "bundle": bundle,
         "current_node": "bundle_creator",
     }
 
 
 # =============================================================================
-# CONSTRUCCIÓN DEL GRAFO V2.1
+# CONSTRUCCIÓN DEL GRAFO V3
 # =============================================================================
 
 def build_phase1_graph() -> StateGraph:
     """
-    Construye el grafo de Phase 1 V2.1 con RAG.
-    
-    CORRECCIONES:
-    - dispatch_prepare es nodo, dispatch_to_writers es conditional_edge
-    - Esto evita InvalidUpdateError
+    Construye el grafo de Phase 1 V3 con RAG avanzado.
     """
-    # Usar TypedDict base para evitar problemas de tipado
-    from typing import TypedDict, Optional
-    
-    class GraphState(TypedDict, total=False):
-        source_path: str
-        raw_content: str
-        source_metadata: dict
-        master_plan: dict
-        db_path: str
-        index_stats: dict
-        writer_tasks: list
-        writer_results: Annotated[list[dict], add_writer_results]
-        ordered_class_markdown: str
-        draft_path: str
-        section_notes_dir: str
-        warnings: list
-        bundle: dict
-        current_node: str
-        error: Optional[str]
-    
-    graph = StateGraph(GraphState)
+    graph = StateGraph(Phase1GraphState)
     
     # Agregar nodos
     graph.add_node("master_planner", master_planner_node)
@@ -461,18 +432,17 @@ def build_phase1_graph() -> StateGraph:
     graph.add_edge("master_planner", "context_indexer")
     graph.add_edge("context_indexer", "dispatch_prepare")
     
-    # BIFURCACIÓN: dispatch_prepare -> Send() -> writer_agent (paralelo)
-    # Usamos add_conditional_edges con la función que retorna Send()
+    # Bifurcación paralela
     graph.add_conditional_edges(
         "dispatch_prepare",
-        dispatch_to_writers,  # Función que retorna list[Send]
-        ["writer_agent"],  # Nodos destino posibles
+        dispatch_to_writers,
+        ["writer_agent"],
     )
     
-    # Writers convergen en collector
+    # Fan-in
     graph.add_edge("writer_agent", "collector")
     
-    # Flujo secuencial final
+    # Flujo final
     graph.add_edge("collector", "assembler")
     graph.add_edge("assembler", "bundle_creator")
     graph.add_edge("bundle_creator", END)
@@ -486,65 +456,60 @@ def build_phase1_graph() -> StateGraph:
 
 def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     """
-    Ejecuta el pipeline completo de Phase 1 V2.1 con RAG.
+    Ejecuta el pipeline completo de Phase 1 V3.
     
     Args:
         source_path: Ruta al archivo fuente
         raw_content: Contenido de texto crudo
         
     Returns:
-        Estado final con bundle
+        Estado final del grafo
     """
-    source_path = Path(source_path)
+    print(f"\n{'='*60}")
+    print("PHASE 1 V3 — RAG AVANZADO")
+    print(f"{'='*60}")
+    print(f"Fuente: {source_path}")
+    print(f"Tamaño: {len(raw_content):,} caracteres")
+    print(f"{'='*60}\n")
     
-    # Generar metadata
-    content_hash = hashlib.sha256(raw_content.encode()).hexdigest()
-    source_metadata = {
-        "filename": source_path.name,
-        "file_path": str(source_path),
-        "file_hash": content_hash,
-        "file_size_bytes": len(raw_content.encode()),
-        "ingested_at": datetime.now().isoformat(),
-        "content_type": "text",
-        "source_id": f"src_{content_hash[:16]}",
-    }
+    # Construir y ejecutar grafo
+    graph = build_phase1_graph()
     
-    # Estado inicial
     initial_state = {
         "source_path": str(source_path),
         "raw_content": raw_content,
-        "source_metadata": source_metadata,
-        
-        # V2.1 fields
-        "master_plan": {},
-        "db_path": "",
-        "index_stats": {},
-        "writer_tasks": [],
-        "writer_results": [],
-        
-        # Output
-        "ordered_class_markdown": "",
-        "draft_path": "",
-        "section_notes_dir": "",
-        "warnings": [],
-        "bundle": {},
-        
-        # Control
-        "current_node": "start",
-        "error": None,
+        "source_metadata": {
+            "path": str(source_path),
+            "size": len(raw_content),
+            "processed_at": datetime.now().isoformat(),
+        },
     }
     
-    # Ejecutar grafo
-    graph = build_phase1_graph()
-    result = graph.invoke(initial_state)
+    # Ejecutar
+    final_state = graph.invoke(initial_state)
     
-    # Opcional: limpiar DB vectorial temporal
-    # cleanup_vector_db(source_metadata["source_id"], VECTOR_DB_DIR)
+    # Resumen
+    print(f"\n{'='*60}")
+    print("RESUMEN")
+    print(f"{'='*60}")
     
-    return result
+    if final_state.get("error"):
+        print(f"✗ Error: {final_state['error']}")
+    else:
+        bundle = final_state.get("bundle", {})
+        print(f"✓ Bundle: {bundle.get('bundle_id', 'N/A')}")
+        print(f"✓ Draft: {bundle.get('draft_path', 'N/A')}")
+        
+        index_stats = final_state.get("index_stats", {})
+        print(f"✓ Chunks: {index_stats.get('chunks_count', 'N/A')}")
+        print(f"✓ Bloques: {index_stats.get('blocks_count', 'N/A')}")
+    
+    print(f"{'='*60}\n")
+    
+    return final_state
 
 
-# Pre-compilar grafo para reutilización
+# Compilar grafo al importar
 graph = build_phase1_graph()
 
 

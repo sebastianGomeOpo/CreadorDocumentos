@@ -1,253 +1,182 @@
 """
-context_indexer.py — El Indexador RAG
+context_indexer.py — Indexador de Contexto V3 (RAG Avanzado)
 
-Reemplaza al chunk_persister. En lugar de cortar archivos físicamente,
-crea un índice vectorial que permite búsqueda semántica.
+Orquesta el pipeline de indexación jerárquica:
+1. HierarchicalChunker: Divide en bloques y chunks
+2. MultiGranularEmbedder: Genera embeddings multi-nivel
+3. HierarchicalIndex: Almacena en ChromaDB
 
-PROBLEMA QUE RESUELVE:
-- La segmentación física fallaba con textos sin estructura clara
-- Un bloque recibía todo, los demás quedaban vacíos
-- Los writers alucinaban por falta de contexto
+Este módulo es el punto de entrada para indexar documentos
+y proporciona la interfaz simplificada para el grafo.
 
-SOLUCIÓN RAG:
-- Normaliza y trocea el texto con sliding windows
-- Crea embeddings y los guarda en ChromaDB
-- Cada Writer busca activamente lo que necesita (Pull vs Push)
-
-VENTAJAS:
-1. Independencia del formato original
-2. Contexto dinámico por tema
-3. Sin duplicación de archivos
-
-CONEXIONES:
-- Input: raw_content + MasterPlan
-- Output: Ruta a la base de datos vectorial
-- Usado por: writer_agent.py (búsqueda semántica)
+MIGRACIÓN desde V2.1:
+- Reemplaza el chunking por ventana fija
+- Ahora preserva estructura jerárquica
+- Soporta búsqueda a nivel chunk Y bloque
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-
-# Imports para embeddings y vectorstore
-try:
-    from langchain_openai import OpenAIEmbeddings
-    from langchain_chroma import Chroma
-    HAS_VECTOR_DEPS = True
-except ImportError:
-    HAS_VECTOR_DEPS = False
-    print("⚠️ Dependencias vectoriales no instaladas. Ejecuta:")
-    print("   pip install langchain-chroma langchain-openai chromadb")
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Importar componentes de indexing
+from core.logic.phase1.indexing.hierarchical_chunker import (
+    HierarchicalChunker,
+    HierarchicalDocument,
+    chunk_document,
+)
+from core.logic.phase1.indexing.multi_granular_embedder import (
+    MultiGranularEmbedder,
+    DocumentEmbeddings,
+    embed_hierarchical_document,
+)
+from core.logic.phase1.indexing.hierarchical_index import (
+    HierarchicalIndex,
+    SearchResult,
+    create_index,
+)
 
 
 # =============================================================================
 # CONFIGURACIÓN
 # =============================================================================
 
-DEFAULT_VECTOR_DB_DIR = Path("data/temp/vector_db")
-CHUNK_SIZE = 1000  # Caracteres por chunk
-CHUNK_OVERLAP = 200  # Solapamiento para contexto
-COLLECTION_NAME = "class_content"
+DEFAULT_VECTOR_DB_DIR = Path(os.getenv("DATA_PATH", "./data")) / "temp" / "hierarchical_index"
+DEFAULT_CHUNK_SIZE = 800
+DEFAULT_CHUNK_OVERLAP = 150
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 # =============================================================================
-# LIMPIEZA DE TEXTO
-# =============================================================================
-
-def clean_text(text: str) -> str:
-    """
-    Limpia y normaliza el texto antes de indexar.
-    
-    - Normaliza saltos de línea
-    - Elimina espacios múltiples
-    - Preserva estructura semántica
-    """
-    import re
-    
-    # Normalizar saltos de línea
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    
-    # Reducir múltiples saltos a máximo 2
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    # Reducir espacios múltiples a uno
-    text = re.sub(r'[ \t]+', ' ', text)
-    
-    # Limpiar líneas que solo tienen espacios
-    lines = [line.strip() for line in text.split('\n')]
-    text = '\n'.join(lines)
-    
-    return text.strip()
-
-
-# =============================================================================
-# CLASE PRINCIPAL: CONTEXT INDEXER
+# CONTEXT INDEXER V3
 # =============================================================================
 
 class ContextIndexer:
     """
-    Indexador de contexto usando RAG (Retrieval Augmented Generation).
+    Indexador de contexto que coordina el pipeline jerárquico.
     
-    Workflow:
-    1. Recibe texto crudo
-    2. Limpia y normaliza
-    3. Divide en chunks con sliding window
-    4. Crea embeddings con OpenAI
-    5. Almacena en ChromaDB local
+    Pipeline:
+    1. Chunking jerárquico (bloques + chunks)
+    2. Embeddings multi-granulares
+    3. Indexación en ChromaDB
+    
+    Uso:
+        indexer = ContextIndexer(db_path)
+        stats = indexer.index(source_id, text)
+        results = indexer.search(source_id, query, k=10)
     """
     
     def __init__(
         self,
-        base_path: Path | str = DEFAULT_VECTOR_DB_DIR,
-        chunk_size: int = CHUNK_SIZE,
-        chunk_overlap: int = CHUNK_OVERLAP,
+        db_path: Path | str = DEFAULT_VECTOR_DB_DIR,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ):
-        if not HAS_VECTOR_DEPS:
-            raise ImportError(
-                "Dependencias vectoriales no instaladas. "
-                "Ejecuta: pip install langchain-chroma langchain-openai chromadb"
-            )
-        
-        self.base_path = Path(base_path)
+        self.db_path = Path(db_path)
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.embedding_model = embedding_model
         
-        # Inicializar text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""],
-        )
+        # Componentes lazy-loaded
+        self._chunker: Optional[HierarchicalChunker] = None
+        self._embedder: Optional[MultiGranularEmbedder] = None
+        self._index: Optional[HierarchicalIndex] = None
         
-        # Inicializar embeddings
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY no configurada")
-        
-        self.embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            api_key=api_key,
+        # Cache de documentos indexados
+        self._indexed_docs: dict[str, HierarchicalDocument] = {}
+    
+    @property
+    def chunker(self) -> HierarchicalChunker:
+        if self._chunker is None:
+            self._chunker = HierarchicalChunker(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+            )
+        return self._chunker
+    
+    @property
+    def embedder(self) -> MultiGranularEmbedder:
+        if self._embedder is None:
+            self._embedder = MultiGranularEmbedder(
+                model=self.embedding_model,
+            )
+        return self._embedder
+    
+    def get_index(self, source_id: str) -> HierarchicalIndex:
+        """Obtiene o crea índice para una fuente."""
+        return HierarchicalIndex(
+            base_path=self.db_path,
+            source_id=source_id,
         )
     
-    def index_content(
+    def index(
         self,
-        raw_content: str,
         source_id: str,
-        metadata: dict[str, Any] | None = None,
+        text: str,
+        metadata: Optional[dict] = None,
     ) -> dict[str, Any]:
         """
-        Indexa el contenido crudo en una base de datos vectorial.
+        Indexa un documento completo.
         
         Args:
-            raw_content: Texto crudo completo
             source_id: ID único de la fuente
-            metadata: Metadata adicional opcional
+            text: Contenido del documento
+            metadata: Metadata adicional
             
         Returns:
-            Diccionario con info de la DB creada
+            Estadísticas de indexación
         """
-        # 1. Limpiar texto
-        clean_content = clean_text(raw_content)
+        start_time = datetime.now()
         
-        # 2. Dividir en chunks
-        chunks = self.text_splitter.split_text(clean_content)
+        # 1. Chunking jerárquico
+        print(f"[ContextIndexer] Chunking documento {source_id}...")
+        hierarchical_doc = self.chunker.chunk_document(text, source_id)
         
-        # 3. Crear documentos con metadata
-        documents = []
-        for i, chunk in enumerate(chunks):
-            doc = Document(
-                page_content=chunk,
-                metadata={
-                    "source_id": source_id,
-                    "chunk_index": i,
-                    "total_chunks": len(chunks),
-                    "chunk_size": len(chunk),
-                    "indexed_at": datetime.now().isoformat(),
-                    **(metadata or {}),
-                }
-            )
-            documents.append(doc)
-        
-        # 4. Crear directorio para esta fuente
-        db_path = self.base_path / source_id
-        
-        # Limpiar si existe
-        if db_path.exists():
-            shutil.rmtree(db_path)
-        db_path.mkdir(parents=True, exist_ok=True)
-        
-        # 5. Crear vectorstore
-        vectorstore = Chroma.from_documents(
-            documents=documents,
-            embedding=self.embeddings,
-            collection_name=COLLECTION_NAME,
-            persist_directory=str(db_path),
+        # 2. Generar embeddings
+        print(f"[ContextIndexer] Generando embeddings para {len(hierarchical_doc.chunks)} chunks...")
+        doc_embeddings = self.embedder.embed_document(
+            hierarchical_doc,
+            include_contextualized=True,
         )
         
-        # 6. Generar estadísticas
-        stats = {
+        # 3. Indexar en ChromaDB
+        print(f"[ContextIndexer] Indexando en ChromaDB...")
+        index = self.get_index(source_id)
+        index_stats = index.index_document(hierarchical_doc, doc_embeddings)
+        
+        # 4. Cachear documento para referencias
+        self._indexed_docs[source_id] = hierarchical_doc
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        
+        return {
             "source_id": source_id,
-            "db_path": str(db_path),
-            "total_chunks": len(chunks),
-            "total_characters": len(clean_content),
-            "avg_chunk_size": sum(len(c) for c in chunks) // len(chunks) if chunks else 0,
-            "indexed_at": datetime.now().isoformat(),
+            "blocks_count": len(hierarchical_doc.blocks),
+            "chunks_count": len(hierarchical_doc.chunks),
+            "chunks_indexed": index_stats.get("chunks_indexed", 0),
+            "blocks_indexed": index_stats.get("blocks_indexed", 0),
+            "embedding_model": self.embedding_model,
+            "elapsed_seconds": elapsed,
+            "db_path": str(index.index_path),
         }
-        
-        return stats
-    
-    def get_retriever(
-        self,
-        source_id: str,
-        k: int = 5,
-    ):
-        """
-        Obtiene un retriever para una fuente indexada.
-        
-        Args:
-            source_id: ID de la fuente
-            k: Número de chunks a recuperar
-            
-        Returns:
-            Retriever configurado
-        """
-        db_path = self.base_path / source_id
-        
-        if not db_path.exists():
-            raise ValueError(f"No existe índice para source_id: {source_id}")
-        
-        vectorstore = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=self.embeddings,
-            persist_directory=str(db_path),
-        )
-        
-        return vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": k},
-        )
     
     def search(
         self,
         source_id: str,
         query: str,
-        k: int = 5,
-    ) -> list[Document]:
+        k: int = 10,
+    ) -> list[SearchResult]:
         """
-        Busca chunks relevantes para una query.
+        Busca chunks relevantes.
         
         Args:
             source_id: ID de la fuente
@@ -255,184 +184,324 @@ class ContextIndexer:
             k: Número de resultados
             
         Returns:
-            Lista de documentos relevantes
+            Lista de SearchResult
         """
-        retriever = self.get_retriever(source_id, k)
-        return retriever.invoke(query)
+        index = self.get_index(source_id)
+        query_embedding = self.embedder.embed_query(query)
+        
+        return index.search_chunks(
+            query_embedding=query_embedding,
+            k=k,
+            filter_source=source_id,
+        )
     
-    def cleanup(self, source_id: str | None = None) -> int:
+    def search_with_context(
+        self,
+        source_id: str,
+        query: str,
+        k: int = 10,
+        expand_neighbors: bool = True,
+    ) -> list[dict]:
         """
-        Limpia bases de datos vectoriales.
+        Busca chunks con contexto estructural.
         
         Args:
-            source_id: Si se proporciona, solo limpia esa fuente.
-                      Si es None, limpia todas.
+            source_id: ID de la fuente
+            query: Texto de búsqueda
+            k: Número de resultados
+            expand_neighbors: Si expandir a vecinos
+            
+        Returns:
+            Lista de dicts con chunk y contexto
+        """
+        index = self.get_index(source_id)
+        query_embedding = self.embedder.embed_query(query)
+        
+        # Buscar chunks
+        results = index.search_chunks(
+            query_embedding=query_embedding,
+            k=k,
+            filter_source=source_id,
+        )
+        
+        enriched = []
+        seen_ids = set()
+        
+        for result in results:
+            if result.id in seen_ids:
+                continue
+            seen_ids.add(result.id)
+            
+            entry = {
+                "chunk_id": result.id,
+                "content": result.content,
+                "score": result.score,
+                "metadata": result.metadata,
+            }
+            
+            # Obtener padre
+            parent = index.get_parent_block(result.id)
+            if parent:
+                entry["parent_heading"] = parent.metadata.get("heading", "")
+                entry["parent_summary"] = parent.content[:200] if parent.content else ""
+            
+            # Obtener vecinos
+            if expand_neighbors:
+                neighbors = index.get_neighbor_chunks(result.id, window=1)
+                entry["neighbors"] = [
+                    {"id": n.id, "content": n.content[:100]}
+                    for n in neighbors
+                    if n.id != result.id
+                ]
+            
+            enriched.append(entry)
+        
+        return enriched
+    
+    def get_document(self, source_id: str) -> Optional[HierarchicalDocument]:
+        """Obtiene documento jerárquico cacheado."""
+        return self._indexed_docs.get(source_id)
+    
+    def get_index_stats(self, source_id: str) -> dict[str, Any]:
+        """Obtiene estadísticas del índice."""
+        index = self.get_index(source_id)
+        return index.get_stats()
+    
+    def delete(self, source_id: str) -> dict[str, int]:
+        """
+        Elimina datos de una fuente.
         
         Returns:
-            Número de DBs eliminadas
+            Estadísticas de eliminación
         """
-        count = 0
+        index = self.get_index(source_id)
+        stats = index.delete_source(source_id)
         
+        if source_id in self._indexed_docs:
+            del self._indexed_docs[source_id]
+        
+        return stats
+    
+    def cleanup(self, source_id: Optional[str] = None) -> None:
+        """
+        Limpia el índice.
+        
+        Args:
+            source_id: Si se especifica, limpia solo esa fuente.
+                       Si es None, limpia todo.
+        """
         if source_id:
-            db_path = self.base_path / source_id
-            if db_path.exists():
-                shutil.rmtree(db_path)
-                count = 1
+            index = self.get_index(source_id)
+            index.cleanup()
+            if source_id in self._indexed_docs:
+                del self._indexed_docs[source_id]
         else:
-            if self.base_path.exists():
-                for item in self.base_path.iterdir():
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                        count += 1
-        
-        return count
+            # Limpiar todo
+            if self.db_path.exists():
+                shutil.rmtree(self.db_path)
+            self._indexed_docs.clear()
 
 
 # =============================================================================
-# FUNCIONES DE CONVENIENCIA PARA EL GRAFO
+# TOPIC RETRIEVER (Para el Writer)
+# =============================================================================
+
+class TopicRetriever:
+    """
+    Retriever especializado para temas del MasterPlan.
+    
+    Usa el pipeline completo:
+    1. Facet Query Planner
+    2. Multi-Channel Retriever
+    3. Fusion Scorer
+    4. Coverage Selector
+    5. Context Assembler
+    """
+    
+    def __init__(
+        self,
+        context_indexer: ContextIndexer,
+        source_id: str,
+    ):
+        self.indexer = context_indexer
+        self.source_id = source_id
+        
+        # Importar componentes de retrieval
+        from core.logic.phase1.retrieval.facet_query_planner import (
+            FacetQueryPlanner,
+            get_recommended_k,
+        )
+        from core.logic.phase1.retrieval.multi_channel_retriever import (
+            MultiChannelRetriever,
+        )
+        from core.logic.phase1.retrieval.fusion_scorer import FusionScorer
+        from core.logic.phase1.retrieval.coverage_selector import CoverageSelector
+        from core.logic.phase1.retrieval.context_assembler import ContextAssembler
+        
+        self.planner = FacetQueryPlanner(use_llm_expansion=True)
+        self.retriever = MultiChannelRetriever(
+            hierarchical_index=self.indexer.get_index(source_id),
+            enable_sparse=True,
+            enable_parent=True,
+        )
+        self.scorer = FusionScorer()
+        self.selector = CoverageSelector()
+        self.assembler = ContextAssembler(
+            hierarchical_index=self.indexer.get_index(source_id)
+        )
+        self.get_recommended_k = get_recommended_k
+    
+    def retrieve_for_topic(
+        self,
+        topic_name: str,
+        must_include: list[str],
+        key_concepts: list[str],
+        navigation_context: Optional[dict] = None,
+        target_chunks: int = 8,
+    ) -> dict[str, Any]:
+        """
+        Recupera contexto completo para un tema.
+        
+        Args:
+            topic_name: Nombre del tema
+            must_include: Conceptos obligatorios
+            key_concepts: Conceptos clave
+            navigation_context: Contexto de navegación
+            target_chunks: Objetivo de chunks
+            
+        Returns:
+            Dict con evidence_pack y métricas
+        """
+        # 1. Crear plan de queries
+        query_plan = self.planner.create_plan(
+            topic_name=topic_name,
+            must_include=must_include,
+            key_concepts=key_concepts,
+            navigation_context=navigation_context,
+        )
+        
+        # 2. Ajustar k según complejidad
+        recommended = self.get_recommended_k(query_plan.estimated_complexity)
+        k_chunks = recommended["chunks"]
+        
+        # 3. Recuperar candidatos multi-canal
+        retrieval_result = self.retriever.retrieve(
+            query_plan=query_plan,
+            source_id=self.source_id,
+            k_per_facet=k_chunks // len(query_plan.facets) + 2,
+        )
+        
+        # 4. Scoring y ranking
+        scoring_result = self.scorer.score_candidates(
+            candidates=retrieval_result.candidates,
+            query_plan=query_plan,
+        )
+        
+        # 5. Selección por cobertura
+        coverage_result = self.selector.select(
+            scoring_result=scoring_result,
+            query_plan=query_plan,
+        )
+        
+        # 6. Ensamblar con contexto
+        evidence_pack = self.assembler.assemble(
+            coverage_result=coverage_result,
+            query_plan=query_plan,
+        )
+        
+        return {
+            "evidence_pack": evidence_pack,
+            "formatted_context": evidence_pack.formatted_context,
+            "coverage": {
+                "total_chunks": coverage_result.total_selected,
+                "required_coverage": coverage_result.required_coverage_pct,
+                "optional_coverage": coverage_result.optional_coverage_pct,
+                "missing_required": coverage_result.missing_required,
+                "is_complete": coverage_result.is_complete,
+            },
+            "metrics": {
+                "candidates_retrieved": len(retrieval_result.candidates),
+                "candidates_scored": len(scoring_result.candidates),
+                "diversity_score": coverage_result.diversity_score,
+                "coherence_score": coverage_result.coherence_score,
+            },
+        }
+
+
+# =============================================================================
+# FUNCIONES DE CONVENIENCIA
 # =============================================================================
 
 def index_content_for_rag(
-    raw_content: str,
     source_id: str,
-    base_path: Path | str = DEFAULT_VECTOR_DB_DIR,
+    text: str,
+    db_path: Path | str = DEFAULT_VECTOR_DB_DIR,
 ) -> dict[str, Any]:
     """
-    Función de entrada para el nodo indexer del grafo.
+    Función de conveniencia para indexar contenido.
     
     Args:
-        raw_content: Texto crudo
         source_id: ID de la fuente
-        base_path: Directorio para la DB
+        text: Contenido a indexar
+        db_path: Ruta del índice
         
     Returns:
-        Info de la DB creada
+        Estadísticas de indexación
     """
-    indexer = ContextIndexer(base_path)
-    return indexer.index_content(raw_content, source_id)
+    indexer = ContextIndexer(db_path)
+    return indexer.index(source_id, text)
 
 
 def search_context(
     source_id: str,
     query: str,
-    k: int = 5,
-    base_path: Path | str = DEFAULT_VECTOR_DB_DIR,
-) -> list[str]:
+    db_path: Path | str = DEFAULT_VECTOR_DB_DIR,
+    k: int = 10,
+) -> list[SearchResult]:
     """
-    Busca contexto relevante para un tema.
+    Función de conveniencia para buscar contexto.
     
     Args:
         source_id: ID de la fuente
-        query: Texto de búsqueda (nombre del tema + conceptos)
-        k: Número de chunks a recuperar
-        base_path: Directorio de la DB
+        query: Texto de búsqueda
+        db_path: Ruta del índice
+        k: Número de resultados
         
     Returns:
-        Lista de textos relevantes
+        Lista de SearchResult
     """
-    indexer = ContextIndexer(base_path)
-    docs = indexer.search(source_id, query, k)
-    return [doc.page_content for doc in docs]
+    indexer = ContextIndexer(db_path)
+    return indexer.search(source_id, query, k)
 
 
 def cleanup_vector_db(
-    source_id: str | None = None,
-    base_path: Path | str = DEFAULT_VECTOR_DB_DIR,
-) -> int:
+    db_path: Path | str = DEFAULT_VECTOR_DB_DIR,
+    source_id: Optional[str] = None,
+) -> None:
     """
-    Limpia bases de datos vectoriales.
+    Función de conveniencia para limpiar el índice.
     
     Args:
-        source_id: ID específico o None para todos
-        base_path: Directorio base
+        db_path: Ruta del índice
+        source_id: Si se especifica, limpia solo esa fuente
+    """
+    indexer = ContextIndexer(db_path)
+    indexer.cleanup(source_id)
+
+
+def create_topic_retriever(
+    source_id: str,
+    db_path: Path | str = DEFAULT_VECTOR_DB_DIR,
+) -> TopicRetriever:
+    """
+    Crea un TopicRetriever listo para usar.
+    
+    Args:
+        source_id: ID de la fuente
+        db_path: Ruta del índice
         
     Returns:
-        Número de DBs eliminadas
+        TopicRetriever configurado
     """
-    indexer = ContextIndexer(base_path)
-    return indexer.cleanup(source_id)
-
-
-# =============================================================================
-# RETRIEVER FACTORY PARA WRITERS
-# =============================================================================
-
-class TopicRetriever:
-    """
-    Retriever especializado para un tema específico.
-    
-    Combina el nombre del tema + conceptos clave para construir
-    queries más efectivas.
-    """
-    
-    def __init__(
-        self,
-        source_id: str,
-        topic_name: str,
-        key_concepts: list[str],
-        must_include: list[str],
-        base_path: Path | str = DEFAULT_VECTOR_DB_DIR,
-        k: int = 8,
-    ):
-        self.source_id = source_id
-        self.topic_name = topic_name
-        self.key_concepts = key_concepts
-        self.must_include = must_include
-        self.base_path = Path(base_path)
-        self.k = k
-        
-        self.indexer = ContextIndexer(base_path)
-    
-    def get_context(self) -> str:
-        """
-        Recupera contexto relevante para el tema.
-        
-        Estrategia de búsqueda múltiple:
-        1. Buscar por nombre del tema
-        2. Buscar por cada concepto clave
-        3. Buscar por cada must_include
-        4. Combinar y deduplicar
-        
-        Returns:
-            Texto concatenado de contexto relevante
-        """
-        all_chunks = set()
-        
-        # Búsqueda 1: Por nombre del tema
-        query1 = self.topic_name
-        docs1 = self.indexer.search(self.source_id, query1, k=self.k)
-        for doc in docs1:
-            all_chunks.add(doc.page_content)
-        
-        # Búsqueda 2: Por conceptos clave
-        if self.key_concepts:
-            query2 = " ".join(self.key_concepts[:5])  # Máximo 5
-            docs2 = self.indexer.search(self.source_id, query2, k=self.k // 2)
-            for doc in docs2:
-                all_chunks.add(doc.page_content)
-        
-        # Búsqueda 3: Por must_include
-        if self.must_include:
-            query3 = " ".join(self.must_include[:3])  # Máximo 3
-            docs3 = self.indexer.search(self.source_id, query3, k=self.k // 2)
-            for doc in docs3:
-                all_chunks.add(doc.page_content)
-        
-        # Combinar con separadores claros
-        combined = "\n\n---\n\n".join(sorted(all_chunks, key=len, reverse=True))
-        
-        return combined
-    
-    def get_context_for_query(self, custom_query: str, k: int = 5) -> str:
-        """
-        Búsqueda personalizada con query específica.
-        
-        Args:
-            custom_query: Query personalizada
-            k: Número de resultados
-            
-        Returns:
-            Contexto concatenado
-        """
-        docs = self.indexer.search(self.source_id, custom_query, k)
-        return "\n\n---\n\n".join(doc.page_content for doc in docs)
+    indexer = ContextIndexer(db_path)
+    return TopicRetriever(indexer, source_id)

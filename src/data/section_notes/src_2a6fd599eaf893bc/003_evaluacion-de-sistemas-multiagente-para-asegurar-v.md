@@ -1,0 +1,23 @@
+---
+title: "Evaluación de sistemas multiagente para asegurar valor y calidad"
+sequence: 3
+source_id: "src_2a6fd599eaf893bc"
+topic_id: "topic_003"
+word_count: 689
+status: success
+created_at: "2025-12-24T22:51:24.145635"
+---
+
+## Evaluación de sistemas multiagente para asegurar valor y calidad
+
+Después de reconocer que muchos proyectos de IA fallan por no ejecutar evaluaciones de forma rigurosa, el siguiente paso es concretar cómo evaluar un sistema multiagente para asegurar que realmente entregue valor y mantenga un nivel de calidad aceptable. Evaluar no es un evento aislado, sino parte de un ciclo de feedback continuo: los resultados de evaluación alimentan ajustes tanto en el sistema como en los recursos que lo soportan. La motivación de fondo es práctica: las decisiones que toma un agente pueden condicionar las decisiones del siguiente agente en el plan de ejecución, o incluso las acciones de una persona que recibe esa información. Si el sistema informa mal —por ejemplo, por usar información caduca o contradictoria— el impacto se traslada directamente al usuario y, por extensión, a la organización.
+
+Un punto central de esta evaluación es distinguir entre valor esperado vs valor entregado. En términos operativos, el valor esperado se expresa como “se logró el objetivo” y debe poder verificarse con evidencias observables: si el sistema debía enviar un correo, producir un reporte o completar una acción, la evaluación debe confirmar si el entregable ocurrió o si falló (incluso por causas como una falla de una API). En ese sentido, la medición del grado de éxito del agente se puede plantear de forma gradual: lo logra, lo logra parcialmente o no lo logra. Esta medición no solo refleja el resultado final, sino también la confiabilidad del sistema cuando interactúa en situaciones que pueden ser confusas o ambiguas.
+
+Para sostener esa medición, se requiere establecer criterios de calidad. En el material se plantea que estos criterios se relacionan con asegurar que “se entrega la información que debe ser” y con identificar riesgos como la expiración de la información o la presencia de documentos que se contradicen, porque eso puede llevar a informar erróneamente al cliente. Desde esta perspectiva, evaluar calidad no es solo revisar la forma de una respuesta, sino validar que lo comunicado sea adecuado para el propósito y no induzca decisiones incorrectas aguas abajo.
+
+Con estos elementos, evaluar también significa observar el desempeño (performance) del sistema multiagente como implementación. El texto menciona la necesidad de comprender “cómo sé que me está yendo bien” en esa performance, y sugiere que la evaluación debe abarcar diferentes aspectos de la ejecución. Esto incluye instrumentar evaluaciones de manera recurrente, incluso en producción, programándolas en horarios específicos para monitorear cómo va el sistema con el tiempo. Junto a ello aparece la idea de apoyar la evaluación con telemetría de ejecuciones: métricas operativas como throughput y requests, vistas a lo largo del tiempo, aportan señales del funcionamiento sostenido del sistema y ayudan a detectar degradaciones o cambios.
+
+La validación de comportamiento aparece como una motivación explícita: se evalúa para asegurarse de que “tal o cual comportamiento no debería pasar” y para transparentar las consecuencias de lo que el sistema hace. Esa validación puede apoyarse en mecanismos que emiten un veredicto y devuelven resultados utilizables como feedback para cambiar componentes del sistema cuando no se está cumpliendo algún criterio. En el texto se mencionan dos enfoques de evaluación basados en una invocación a un modelo y otro donde un evaluador puede operar con herramientas adicionales, incluso conectándose a procesos de negocio como herramientas para decidir si “pasó o no” un criterio interno de scoring. En ambos casos, lo importante es que los resultados de la evaluación regresan al ciclo: permiten identificar dónde se está ejecutando bien, pero también dónde no se está logrando un criterio definido.
+
+Finalmente, el material introduce prácticas para probar el sistema desde múltiples ángulos: crear diferentes roles con personalidades, variar sistemáticamente los inputs y verificar consistencia de respuestas. La idea es que, al cambiar personalidades o inputs, el tipo de respuesta que el sistema debe dar se mantenga consistente o “siempre la misma o acercada siempre a la misma”. Además, se sugiere la orquestación de agentes evaluadores, donde diferentes agentes podrían revisar la corrección del resultado, lo que refuerza el enfoque de evaluación por múltiples ángulos. Con estas bases, la siguiente sección profundiza en métricas específicas para evaluar respuestas.
