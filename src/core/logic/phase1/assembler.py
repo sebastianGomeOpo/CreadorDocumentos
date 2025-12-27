@@ -105,11 +105,47 @@ class Assembler:
         self,
         results: list[WriterResult | dict],
     ) -> list[WriterResult]:
-        """Convierte dicts a WriterResult si es necesario."""
+        """
+        Convierte dicts a WriterResult si es necesario.
+        
+        NOTA: El writer_agent.py devuelve campos con nombres diferentes
+        a los que espera WriterResult en state_schema.py. Este método
+        hace el mapeo necesario.
+        
+        Mapeo de campos:
+            writer_agent          →  WriterResult (state_schema)
+            ─────────────────────────────────────────────────────
+            topic_index           →  sequence_id
+            markdown              →  compiled_markdown
+            must_include_followed →  followed_must_include
+            must_exclude_violated →  violated_must_exclude
+            (generado)            →  topic_id
+        """
         normalized = []
-        for r in results:
+        for i, r in enumerate(results):
             if isinstance(r, dict):
-                normalized.append(WriterResult(**r))
+                # Mapear campos del writer_agent al schema de WriterResult
+                mapped = {
+                    # Campos requeridos con mapeo de nombres
+                    "sequence_id": r.get("topic_index", r.get("sequence_id", i)),
+                    "topic_id": r.get("topic_id", f"topic_{r.get('topic_index', i):03d}"),
+                    "topic_name": r.get("topic_name", "Sin nombre"),
+                    "compiled_markdown": r.get("markdown", r.get("compiled_markdown", "")),
+                    
+                    # Campos opcionales
+                    "word_count": r.get("word_count", 0),
+                    "processing_time_ms": r.get("processing_time_ms", 0),
+                    
+                    # Mapeo de validación (nombres similares pero diferentes)
+                    "followed_must_include": r.get("must_include_followed", r.get("followed_must_include", [])),
+                    "violated_must_exclude": r.get("must_exclude_violated", r.get("violated_must_exclude", [])),
+                    "warnings": r.get("warnings", []),
+                    
+                    # Estado
+                    "success": not r.get("error") and r.get("coverage_complete", True),
+                    "error_message": r.get("error", r.get("error_message")),
+                }
+                normalized.append(WriterResult(**mapped))
             else:
                 normalized.append(r)
         return normalized

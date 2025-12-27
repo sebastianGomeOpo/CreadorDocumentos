@@ -137,6 +137,23 @@ class Phase1GraphState(TypedDict, total=False):
 
 
 # =============================================================================
+# UTILIDADES
+# =============================================================================
+
+def _detect_content_type(source_path: Path) -> str:
+    """Detecta el tipo de contenido basado en la extensión."""
+    ext = source_path.suffix.lower() if hasattr(source_path, 'suffix') else ""
+    type_map = {
+        ".txt": "text",
+        ".md": "markdown",
+        ".pdf": "pdf",
+        ".vtt": "transcript",
+        ".srt": "transcript",
+    }
+    return type_map.get(ext, "text")
+
+
+# =============================================================================
 # NODOS DEL GRAFO
 # =============================================================================
 
@@ -443,12 +460,15 @@ def assembler_node(state: Phase1GraphState) -> dict:
 def bundle_creator_node(state: Phase1GraphState) -> dict:
     """
     Crea el bundle final para revisión.
+    
+    FIX V3.1.1: Normaliza source_metadata para cumplir con SourceMetadata schema.
     """
     print(f"\n{'='*60}")
     print("[BundleCreator] Creando bundle...")
     print(f"{'='*60}")
     
     source_path = state.get("source_path", "")
+    raw_content = state.get("raw_content", "")
     source_id = state.get("source_id", "") or generate_source_id(source_path)
     bundle_id = generate_bundle_id(source_id)
     
@@ -457,11 +477,32 @@ def bundle_creator_node(state: Phase1GraphState) -> dict:
     if error:
         print(f"[BundleCreator] ⚠️ Bundle con error: {error}")
     
+    # ============================================
+    # FIX: Normalizar source_metadata a estructura correcta
+    # que coincide con SourceMetadata en state_schema.py
+    # ============================================
+    raw_metadata = state.get("source_metadata", {})
+    
+    # Si ya tiene los campos correctos, usarlos; sino, generarlos
+    if "filename" in raw_metadata and "file_hash" in raw_metadata:
+        source_metadata = raw_metadata
+    else:
+        # Convertir desde formato antiguo {path, size, processed_at}
+        path = Path(source_path) if source_path else Path("unknown")
+        source_metadata = {
+            "filename": path.name,
+            "file_path": str(path),
+            "file_hash": hashlib.sha256(raw_content.encode()).hexdigest() if raw_content else "",
+            "file_size_bytes": len(raw_content.encode('utf-8')) if raw_content else 0,
+            "ingested_at": raw_metadata.get("processed_at", datetime.now().isoformat()),
+            "content_type": _detect_content_type(path),
+        }
+    
     bundle = {
         "bundle_id": bundle_id,
         "source_path": source_path,
-        "source_metadata": state.get("source_metadata", {}),
-        "raw_content_preview": state.get("raw_content", "")[:500],
+        "source_metadata": source_metadata,  # ← Ahora con estructura correcta
+        "raw_content_preview": raw_content[:500] if raw_content else "",
         "master_plan": state.get("master_plan", {}),
         "draft_path": state.get("draft_path", ""),
         "section_notes_dir": state.get("section_notes_dir", ""),
@@ -548,13 +589,22 @@ def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     # Construir y ejecutar grafo
     graph = build_phase1_graph()
     
+    # FIX: Generar source_metadata con estructura correcta para SourceMetadata
+    file_hash = hashlib.sha256(raw_content.encode()).hexdigest()
+    source_path_obj = Path(source_path)
+    
     initial_state = {
         "source_path": str(source_path),
         "raw_content": raw_content,
         "source_metadata": {
-            "path": str(source_path),
-            "size": len(raw_content),
-            "processed_at": datetime.now().isoformat(),
+            # Campos REQUERIDOS por SourceMetadata (state_schema.py)
+            "filename": source_path_obj.name,
+            "file_path": str(source_path),
+            "file_hash": file_hash,
+            "file_size_bytes": len(raw_content.encode('utf-8')),
+            # Campos opcionales
+            "ingested_at": datetime.now().isoformat(),
+            "content_type": _detect_content_type(source_path_obj),
         },
     }
     
@@ -663,8 +713,10 @@ PHASE1_GRAPH_DIAGRAM = """
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
-CORRECCIONES V3.1:
+CORRECCIONES V3.1.1:
 - FIX #1: master_planner_node ahora pasa source_id a create_master_plan()
 - FIX #2: context_indexer_node maneja PermissionError en cleanup (Windows)
+- FIX #3: run_phase1() genera source_metadata con estructura correcta
+- FIX #4: bundle_creator_node normaliza source_metadata defensivamente
 - dispatch_to_writers ahora maneja caso sin tareas correctamente
 """
