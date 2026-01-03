@@ -361,7 +361,7 @@ class ContextIndexer:
                     time.sleep(0.5 * (attempt + 1))  # Backoff exponencial
                 else:
                     # En el último intento, loguear pero no fallar
-                    print(f"[ContextIndexer] ⚠️ No se pudo eliminar {path}: {e}")
+                    print(f"[ContextIndexer] [WARN] No se pudo eliminar {path}: {e}")
                     print("[ContextIndexer] Los archivos se sobrescribirán en la próxima indexación")
                     return False
             except Exception as e:

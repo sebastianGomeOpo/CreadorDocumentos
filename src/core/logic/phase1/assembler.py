@@ -179,7 +179,7 @@ class Assembler:
         lines.append("## Contenido")
         lines.append("")
         for result in results:
-            status = "✓" if result.success else "✗"
+            status = "[OK]" if result.success else "[FAIL]"
             lines.append(f"- [{status}] [{result.topic_name}](#{self._slugify(result.topic_name)})")
         lines.append("")
         lines.append("---")
@@ -289,7 +289,7 @@ class Assembler:
         lines.append("|---|------|----------|--------|")
         
         for result in results:
-            status = "✅" if result.success else "❌"
+            status = "[OK]" if result.success else "[FAIL]"
             filename = f"{result.sequence_id:03d}_{self._slugify(result.topic_name)}.md"
             lines.append(
                 f"| {result.sequence_id} | [{result.topic_name}]({filename}) | "
@@ -356,7 +356,7 @@ class Assembler:
             lines.append("### Advertencias")
             lines.append("")
             for w in all_warnings:
-                lines.append(f"- ⚠️ {w}")
+                lines.append(f"- [WARN] {w}")
         
         return "\n".join(lines)
     

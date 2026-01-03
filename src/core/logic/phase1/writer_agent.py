@@ -375,15 +375,15 @@ class WriterAgent:
         
         pct = coverage.get("required_coverage", 0)
         if pct >= 0.8:
-            lines.append(f"✓ Cobertura alta ({pct:.0%} de conceptos obligatorios)")
+            lines.append(f"[OK] Cobertura alta ({pct:.0%} de conceptos obligatorios)")
         elif pct >= 0.5:
-            lines.append(f"⚠ Cobertura parcial ({pct:.0%} de conceptos obligatorios)")
+            lines.append(f"[WARN] Cobertura parcial ({pct:.0%} de conceptos obligatorios)")
         else:
-            lines.append(f"⚠ Cobertura baja ({pct:.0%} de conceptos obligatorios)")
+            lines.append(f"[WARN] Cobertura baja ({pct:.0%} de conceptos obligatorios)")
         
         missing = coverage.get("missing_required", [])
         if missing:
-            lines.append(f"⚠ Sin evidencia para: {', '.join(missing)}")
+            lines.append(f"[WARN] Sin evidencia para: {', '.join(missing)}")
         
         lines.append(f"Fragmentos disponibles: {coverage.get('total_chunks', 0)}")
         

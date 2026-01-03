@@ -182,7 +182,7 @@ def master_planner_node(state: Phase1GraphState) -> dict:
             topic_list = master_plan.topics
             master_plan = master_plan.model_dump()  # Convertir a dict para el estado
         
-        print(f"[MasterPlanner] ✓ {len(topic_list)} temas identificados")
+        print(f"[MasterPlanner] [OK] {len(topic_list)} temas identificados")
         for i, topic in enumerate(topic_list):
             if isinstance(topic, dict):
                 print(f"  {i+1}. {topic.get('topic_name', topic.get('name', 'Sin nombre'))}")
@@ -231,17 +231,17 @@ def context_indexer_node(state: Phase1GraphState) -> dict:
         try:
             indexer.cleanup(source_id)
         except PermissionError as pe:
-            print(f"[ContextIndexer] ⚠️ No se pudo limpiar índice anterior (archivo en uso): {pe}")
+            print(f"[ContextIndexer] [WARN] No se pudo limpiar índice anterior (archivo en uso): {pe}")
             print("[ContextIndexer] Continuando con re-indexación...")
         except Exception as ce:
-            print(f"[ContextIndexer] ⚠️ Advertencia en cleanup: {ce}")
+            print(f"[ContextIndexer] [WARN] Advertencia en cleanup: {ce}")
         
         # Indexar documento
         stats = indexer.index(source_id, raw_content)
         
-        print(f"[ContextIndexer] ✓ {stats['chunks_count']} chunks indexados")
-        print(f"[ContextIndexer] ✓ {stats['blocks_count']} bloques detectados")
-        print(f"[ContextIndexer] ✓ Tiempo: {stats['elapsed_seconds']:.2f}s")
+        print(f"[ContextIndexer] [OK] {stats['chunks_count']} chunks indexados")
+        print(f"[ContextIndexer] [OK] {stats['blocks_count']} bloques detectados")
+        print(f"[ContextIndexer] [OK] Tiempo: {stats['elapsed_seconds']:.2f}s")
         
         return {
             "source_id": source_id,
@@ -279,7 +279,7 @@ def dispatch_prepare_node(state: Phase1GraphState) -> dict:
     print(f"{'='*60}")
     
     if total_topics == 0:
-        print("[Dispatch] ⚠️ No hay temas en el MasterPlan")
+        print("[Dispatch] [WARN] No hay temas en el MasterPlan")
         return {
             "writer_tasks": [],
             "current_node": "dispatch_prepare",
@@ -351,16 +351,16 @@ def writer_agent_node(task_state: dict) -> dict:
     try:
         result = run_writer_agent(task_state)
         
-        print(f"  [Writer {topic_index + 1}] ✓ {result['word_count']} palabras")
+        print(f"  [Writer {topic_index + 1}] [OK] {result['word_count']} palabras")
         if result.get("warnings"):
             for w in result["warnings"]:
-                print(f"  [Writer {topic_index + 1}] ⚠ {w}")
+                print(f"  [Writer {topic_index + 1}] [WARN] {w}")
         
         # Retornar para el reducer
         return {"writer_results": result}
         
     except Exception as e:
-        print(f"  [Writer {topic_index + 1}] ✗ Error: {str(e)}")
+        print(f"  [Writer {topic_index + 1}] [FAIL] Error: {str(e)}")
         return {
             "writer_results": {
                 "topic_name": topic_name,
@@ -401,8 +401,8 @@ def collector_node(state: Phase1GraphState) -> dict:
     total_words = sum(r.get("word_count", 0) for r in sorted_results)
     with_warnings = sum(1 for r in sorted_results if r.get("warnings"))
     
-    print(f"[Collector] ✓ {total_words} palabras totales")
-    print(f"[Collector] ✓ {with_warnings} secciones con warnings")
+    print(f"[Collector] [OK] {total_words} palabras totales")
+    print(f"[Collector] [OK] {with_warnings} secciones con warnings")
     
     return {
         "writer_results": sorted_results,
@@ -425,7 +425,7 @@ def assembler_node(state: Phase1GraphState) -> dict:
     
     # Si hay error previo o no hay resultados, crear bundle mínimo
     if state.get("error") or not writer_results:
-        print("[Assembler] ⚠️ Sin resultados para ensamblar")
+        print("[Assembler] [WARN] Sin resultados para ensamblar")
         return {
             "ordered_class_markdown": "",
             "draft_path": "",
@@ -437,8 +437,8 @@ def assembler_node(state: Phase1GraphState) -> dict:
     try:
         result = run_assembler(writer_results, source_id, master_plan)
         
-        print(f"[Assembler] ✓ Documento ensamblado")
-        print(f"[Assembler] ✓ Draft: {result.get('draft_path', 'N/A')}")
+        print(f"[Assembler] [OK] Documento ensamblado")
+        print(f"[Assembler] [OK] Draft: {result.get('draft_path', 'N/A')}")
         
         return {
             "ordered_class_markdown": result.get("markdown", ""),
@@ -475,7 +475,7 @@ def bundle_creator_node(state: Phase1GraphState) -> dict:
     # Verificar si hubo error
     error = state.get("error")
     if error:
-        print(f"[BundleCreator] ⚠️ Bundle con error: {error}")
+        print(f"[BundleCreator] [WARN] Bundle con error: {error}")
     
     # ============================================
     # FIX: Normalizar source_metadata a estructura correcta
@@ -514,7 +514,7 @@ def bundle_creator_node(state: Phase1GraphState) -> dict:
         "error": error,
     }
     
-    print(f"[BundleCreator] ✓ Bundle ID: {bundle_id}")
+    print(f"[BundleCreator] [OK] Bundle ID: {bundle_id}")
     
     return {
         "bundle": bundle,
@@ -617,15 +617,15 @@ def run_phase1(source_path: Path | str, raw_content: str) -> dict[str, Any]:
     print(f"{'='*60}")
     
     if final_state.get("error"):
-        print(f"✗ Error: {final_state['error']}")
+        print(f"[FAIL] Error: {final_state['error']}")
     else:
         bundle = final_state.get("bundle", {})
-        print(f"✓ Bundle: {bundle.get('bundle_id', 'N/A')}")
-        print(f"✓ Draft: {bundle.get('draft_path', 'N/A')}")
+        print(f"[OK] Bundle: {bundle.get('bundle_id', 'N/A')}")
+        print(f"[OK] Draft: {bundle.get('draft_path', 'N/A')}")
         
         index_stats = final_state.get("index_stats", {})
-        print(f"✓ Chunks: {index_stats.get('chunks_count', 'N/A')}")
-        print(f"✓ Bloques: {index_stats.get('blocks_count', 'N/A')}")
+        print(f"[OK] Chunks: {index_stats.get('chunks_count', 'N/A')}")
+        print(f"[OK] Bloques: {index_stats.get('blocks_count', 'N/A')}")
     
     print(f"{'='*60}\n")
     

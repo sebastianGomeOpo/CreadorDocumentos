@@ -580,6 +580,6 @@ def get_coverage_summary(result: CoverageResult) -> str:
     ]
     
     if result.missing_required:
-        lines.append(f"⚠️ Facetas required faltantes: {', '.join(result.missing_required)}")
+        lines.append(f"[WARN] Facetas required faltantes: {', '.join(result.missing_required)}")
     
     return "\n".join(lines)

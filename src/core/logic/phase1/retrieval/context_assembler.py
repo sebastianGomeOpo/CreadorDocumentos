@@ -424,9 +424,9 @@ def format_for_prompt(
     # Cobertura
     if include_coverage_info:
         if evidence_pack.facets_covered:
-            parts.append(f"✓ Cubre: {', '.join(evidence_pack.facets_covered)}")
+            parts.append(f"[OK] Cubre: {', '.join(evidence_pack.facets_covered)}")
         if evidence_pack.facets_missing:
-            parts.append(f"⚠ Falta: {', '.join(evidence_pack.facets_missing)}")
+            parts.append(f"[WARN] Falta: {', '.join(evidence_pack.facets_missing)}")
         parts.append("")
     
     # Contenido

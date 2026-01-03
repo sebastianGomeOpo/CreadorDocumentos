@@ -130,7 +130,7 @@ class Phase1Watcher:
         Returns:
             True si se procesó exitosamente
         """
-        logger.info(f"📄 Procesando: {file_path.name}")
+        logger.info(f"[FILE] Procesando: {file_path.name}")
         
         try:
             # 1. Leer contenido
@@ -138,22 +138,22 @@ class Phase1Watcher:
                 raw_content = f.read()
             
             if not raw_content.strip():
-                logger.warning(f"  ⚠️ Archivo vacío: {file_path.name}")
+                logger.warning(f"  [WARN] Archivo vacío: {file_path.name}")
                 return False
             
             # 2. Ejecutar Phase1Graph V2
-            logger.info("  🚀 Ejecutando Phase1Graph V2...")
+            logger.info("  [RUN] Ejecutando Phase1Graph V2...")
             start_time = time.time()
             
             result = run_phase1(file_path, raw_content)
             
             elapsed = time.time() - start_time
-            logger.info(f"  ⏱️ Completado en {elapsed:.2f}s")
+            logger.info(f"  [TIME] Completado en {elapsed:.2f}s")
             
             # 3. Extraer bundle del resultado
             bundle_dict = result.get("bundle")
             if not bundle_dict:
-                logger.error("  ❌ No se generó bundle")
+                logger.error("  [FAIL] No se generó bundle")
                 return False
             
             # 4. Convertir a Phase1Bundle y guardar
@@ -175,20 +175,20 @@ class Phase1Watcher:
             
             # 5. Guardar bundle en staging
             bundle_path = self.bundle_store.save_phase1_bundle(bundle, status="pending")
-            logger.info(f"  ✅ Bundle guardado: {bundle_path.name}")
+            logger.info(f"  [OK] Bundle guardado: {bundle_path.name}")
             
             # 6. Log de productos generados
             if bundle.draft_path:
-                logger.info(f"  📝 Draft: {bundle.draft_path}")
+                logger.info(f"  [DRAFT] Draft: {bundle.draft_path}")
             if bundle.section_notes_dir:
-                logger.info(f"  📁 Notas: {bundle.section_notes_dir}")
+                logger.info(f"  [DIR] Notas: {bundle.section_notes_dir}")
             
             # 7. Estadísticas del plan
             if bundle.master_plan:
                 plan = bundle.master_plan
                 topic_count = len(plan.get("topics", []))
                 risk_count = len(plan.get("detected_risks", []))
-                logger.info(f"  📊 Plan: {topic_count} temas, {risk_count} riesgos detectados")
+                logger.info(f"  [STATS] Plan: {topic_count} temas, {risk_count} riesgos detectados")
             
             # 8. Actualizar registro
             self.processed_hashes[str(file_path)] = self._get_file_hash(file_path)
@@ -197,12 +197,12 @@ class Phase1Watcher:
             # 9. Mover archivo a processed
             processed_file = self.processed_path / file_path.name
             shutil.move(str(file_path), str(processed_file))
-            logger.info(f"  📦 Archivo movido a processed/")
+            logger.info(f"  [PKG] Archivo movido a processed/")
             
             return True
             
         except Exception as e:
-            logger.exception(f"  ❌ Error procesando {file_path.name}: {e}")
+            logger.exception(f"  [FAIL] Error procesando {file_path.name}: {e}")
             return False
     
     def run_once(self) -> int:
@@ -217,7 +217,7 @@ class Phase1Watcher:
         if not files:
             return 0
         
-        logger.info(f"📥 Encontrados {len(files)} archivo(s) para procesar")
+        logger.info(f"[INBOX] Encontrados {len(files)} archivo(s) para procesar")
         
         processed_count = 0
         for file_path in files:
@@ -233,16 +233,16 @@ class Phase1Watcher:
         Args:
             interval: Segundos entre escaneos
         """
-        logger.info(f"🔄 Iniciando watcher V2 (intervalo: {interval}s)")
-        logger.info(f"📂 Vigilando: {self.inbox_path}")
+        logger.info(f"[START] Iniciando watcher V2 (intervalo: {interval}s)")
+        logger.info(f"[WATCH] Vigilando: {self.inbox_path}")
         
         while True:
             try:
                 count = self.run_once()
                 if count > 0:
-                    logger.info(f"✨ Procesados {count} archivo(s)")
+                    logger.info(f"[DONE] Procesados {count} archivo(s)")
             except KeyboardInterrupt:
-                logger.info("🛑 Detenido por usuario")
+                logger.info("[STOP] Detenido por usuario")
                 break
             except Exception as e:
                 logger.exception(f"Error en ciclo de escaneo: {e}")
